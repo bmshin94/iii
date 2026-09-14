@@ -78,10 +78,11 @@ pub struct InitArgs {
     #[arg(long = "allow-non-empty")]
     pub allow_non_empty: bool,
 
-    /// Take the 5-minute tour of iii: scaffold the "harness" template into
-    /// NAME, or into ./learn-iii (learn-iii-1, learn-iii-2, ... when taken)
-    /// if no NAME is given, then start `iii compose --up` inside it. Cannot
-    /// be combined with any other scaffolding option.
+    /// Start the iii harness and take a quick look at what iii can do:
+    /// scaffold the "harness" template into NAME, or into ./learn-iii
+    /// (learn-iii-1, learn-iii-2, ... when taken) if no NAME is given, then
+    /// start `iii compose --up` inside it. Cannot be combined with any other
+    /// scaffolding option.
     #[arg(long = "learn-iii", conflicts_with_all = ["directory", "template", "docker", "template_dir"])]
     pub learn_iii: bool,
 }
@@ -515,14 +516,21 @@ value:
 /// console's "Extension page not loaded" placeholder.
 ///
 /// A version is not optional for a `package://` container (compose rejects
-/// the file without one), so this is a range rather than a pin: patch
+/// the file without one), so this tracks the `latest` release tag: new
 /// releases of the tour reach a new project with no engine release.
+///
+/// A tag, not a semver range, because the registry resolves range selectors
+/// only against versions promoted to `latest`, while an exact pin is the
+/// only escape hatch for an unpromoted one. A prerelease like
+/// `0.1.0-experimental` therefore matches no range — `^0.1.0` excludes
+/// prereleases outright — but the `latest` tag selector resolves it the
+/// moment that tag points at it.
 const ONBOARDING_CONTAINER: &str = "\
   # The guided tour. It serves the `onboarding` console page that the seeded
   # workspace layout opens beside the chat.
   onboarding:
     worker: package://onboarding
-    version: \"^0.1.0\"
+    version: \"latest\"
     start_after:
       - state
 
@@ -1311,7 +1319,7 @@ mod tests {
         assert!(patched.contains("namespace: demo"));
 
         // Compose rejects a `package://` container with no version.
-        assert!(patched.contains("version: \"^0.1.0\""));
+        assert!(patched.contains("version: \"latest\""));
     }
 
     #[test]

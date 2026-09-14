@@ -851,30 +851,34 @@ case ":$PATH:" in
 esac
 
 # ---------------------------------------------------------------------------
-# Onboarding: offer a 5-minute tour.
+# Onboarding: offer to start the harness.
 # stdin is the script itself under `curl ... | sh`, so read the answer from
 # /dev/tty. Skip silently when no terminal is attached (CI, Dockerfiles).
 # ---------------------------------------------------------------------------
 
-tour_url="https://iii.dev/docs/quickstart"
+start_cmd="$BIN_NAME project init --learn-iii"
+quickstart_url="https://iii.dev/docs/quickstart"
 
 if [ -t 2 ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
   echo ""
-  printf 'Would you like a 5 minute tour of iii? [Y/n] ' >/dev/tty
-  read -r _tour_answer </dev/tty || _tour_answer="n"
-  case "$_tour_answer" in
+  printf 'Would you like to start the iii harness and take a quick look at what iii can do? [Y/n] ' >/dev/tty
+  read -r _harness_answer </dev/tty || _harness_answer="n"
+  case "$_harness_answer" in
     ""|[Yy]|[Yy][Ee][Ss])
-      # Older binaries lack --learn-iii; fall back to the quickstart URL.
       if "$bin_dir/$BIN_NAME" project init --help 2>/dev/null | grep -q -- '--learn-iii'; then
         exec "$bin_dir/$BIN_NAME" project init --learn-iii
       fi
-      echo "Tour: $tour_url"
+      # Older binaries lack --learn-iii; fall back to the quickstart URL.
+      echo ""
+      echo "If you're new to iii, get started quickly here: $quickstart_url"
       ;;
     *)
-      echo "No problem. Start anytime: $tour_url"
+      echo "No problem. Start the harness anytime with:"
+      echo "  $start_cmd"
       ;;
   esac
 else
   echo ""
-  echo "If you're new to iii, get started quickly here: $tour_url"
+  echo "To start the iii harness and see what iii can do, run:"
+  echo "  $start_cmd"
 fi
