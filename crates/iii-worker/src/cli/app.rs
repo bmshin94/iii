@@ -89,10 +89,10 @@ pub enum Commands {
         args: AddArgs,
     },
 
-    /// Update workers pinned in iii.lock to the latest version published in the registry,
-    /// rewriting config.yaml and iii.lock
+    /// Update workers from the registry using declared dependency selectors
+    /// (or latest when undeclared), rewriting config.yaml and iii.lock
     Update {
-        /// Optional worker name to update. If omitted, updates every worker in iii.lock.
+        /// Optional pinned worker name. If omitted, updates locked roots and declared dependencies.
         #[arg(value_name = "WORKER")]
         worker_name: Option<String>,
     },

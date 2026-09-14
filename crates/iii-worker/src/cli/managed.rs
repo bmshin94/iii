@@ -1012,6 +1012,9 @@ fn local_worker_manifest_paths() -> Result<BTreeMap<String, String>, String> {
 
 fn version_satisfies_range(version: &str, range: &str) -> Result<(), String> {
     let version = semver::Version::parse(version).map_err(|e| format!("invalid version: {e}"))?;
+    if super::worker_manifest_deps::is_dependency_tag(range) {
+        return Ok(());
+    }
     let range = semver::VersionReq::parse(range).map_err(|e| format!("invalid range: {e}"))?;
     if range.matches(&version) {
         Ok(())
@@ -1095,7 +1098,7 @@ pub async fn handle_worker_update(worker_name: Option<&str>) -> i32 {
         }
     };
 
-    let names: Vec<String> = match worker_name {
+    let mut names: Vec<String> = match worker_name {
         Some(name) => {
             if !lockfile.workers.contains_key(name) {
                 eprintln!("{} Worker '{}' is not in iii.lock", "error:".red(), name);
@@ -1106,32 +1109,70 @@ pub async fn handle_worker_update(worker_name: Option<&str>) -> i32 {
         None => locked_root_worker_names(&lockfile),
     };
 
+    let manifest_state = load_cwd_manifest_state();
+    let declared = match &manifest_state {
+        ManifestState::Loaded(deps) => Some(deps.clone()),
+        ManifestState::Missing => lockfile.declared_dependencies.clone(),
+        ManifestState::Malformed(e) => {
+            eprintln!("{} {}", "error:".red(), e);
+            return 1;
+        }
+    };
+
+    if let Some(name) = worker_name {
+        if let Some(deps) = &declared {
+            let previous = lockfile.declared_dependencies.as_ref();
+            let other_changed = deps.iter().any(|(dep, selector)| {
+                dep != name && previous.and_then(|old| old.get(dep)) != Some(selector)
+            }) || previous
+                .is_some_and(|old| old.keys().any(|dep| dep != name && !deps.contains_key(dep)));
+            if other_changed {
+                eprintln!(
+                    "{} other manifest dependencies changed; run `iii worker update` to refresh all declared dependencies.",
+                    "error:".red()
+                );
+                return 1;
+            }
+        }
+    } else if let Some(deps) = &declared {
+        names.extend(deps.keys().cloned());
+        names.sort();
+        names.dedup();
+    }
+
     if names.is_empty() {
         eprintln!("  No workers pinned in iii.lock; nothing to update.");
         return 0;
     }
 
-    let mut fail_count = 0;
-    for name in &names {
-        let graph = match fetch_resolved_worker_graph(name, Some("latest"), None).await {
-            Ok(graph) => graph,
-            Err(e) => {
-                eprintln!("{} {}", "error:".red(), e);
-                fail_count += 1;
-                continue;
+    let selectors = names
+        .into_iter()
+        .map(|name| {
+            let selector = declared
+                .as_ref()
+                .and_then(|deps| deps.get(&name))
+                .cloned()
+                .unwrap_or_else(|| "latest".to_string());
+            (name, selector)
+        })
+        .collect();
+    match prepare_manifest_dependencies(&selectors, true, false).await {
+        Ok(Some(mut prepared)) => {
+            prepared.prepared.manifest_state = Some(manifest_state);
+            match install_prepared_manifest_dependencies(prepared, false).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{} {}", "error:".red(), e);
+                    1
+                }
             }
-        };
-
-        // `worker update` is an explicit request to apply the new graph for
-        // an already-pinned root. Do not introduce an unrelated interactive
-        // prompt into that maintenance path.
-        let rc = handle_resolved_graph_add(&graph, false, true, false).await;
-        if rc != 0 {
-            fail_count += 1;
+        }
+        Ok(None) => 0,
+        Err(e) => {
+            eprintln!("{} {}", "error:".red(), e);
+            1
         }
     }
-
-    if fail_count == 0 { 0 } else { 1 }
 }
 
 fn locked_root_worker_names(lockfile: &super::lockfile::WorkerLockfile) -> Vec<String> {
@@ -1470,6 +1511,7 @@ fn confirm_large_dependency_graph(
     }
 }
 
+#[cfg(test)]
 async fn handle_resolved_graph_add(
     graph: &ResolvedWorkerGraph,
     brief: bool,
@@ -1489,6 +1531,7 @@ async fn handle_resolved_graph_add(
 
 struct PreparedResolvedGraph {
     graph_lockfile: super::lockfile::WorkerLockfile,
+    manifest_state: Option<ManifestState>,
 }
 
 /// Complete every fallible, non-mutating graph check before an install may
@@ -1517,7 +1560,10 @@ fn preflight_resolved_graph(
         Ok(lockfile)
     })?;
 
-    Ok(PreparedResolvedGraph { graph_lockfile })
+    Ok(PreparedResolvedGraph {
+        graph_lockfile,
+        manifest_state: None,
+    })
 }
 
 async fn handle_preflighted_resolved_graph_add(
@@ -1525,7 +1571,10 @@ async fn handle_preflighted_resolved_graph_add(
     prepared: PreparedResolvedGraph,
     brief: bool,
 ) -> i32 {
-    let PreparedResolvedGraph { graph_lockfile } = prepared;
+    let PreparedResolvedGraph {
+        graph_lockfile,
+        manifest_state,
+    } = prepared;
 
     let lock_path = super::lockfile::lockfile_path();
     let mut lockfile = match read_lockfile_or_default(lock_path) {
@@ -1655,7 +1704,24 @@ async fn handle_preflighted_resolved_graph_add(
     // Slice A.1 limitation: only the cwd manifest is scanned. Multi-worker
     // projects with manifests in subdirectories won't get aggregate
     // drift detection until Slice A.2 adds project-wide scanning.
-    populate_manifest_hash_fields(&mut lockfile);
+    match manifest_state {
+        Some(ManifestState::Loaded(deps)) => {
+            lockfile.manifest_hash = Some(super::sync::compute_manifest_hash(&deps));
+            lockfile.declared_dependencies = Some(deps);
+        }
+        Some(ManifestState::Missing) => {
+            if Path::new("iii.worker.yaml").exists() {
+                eprintln!(
+                    "{} iii.worker.yaml appeared during update; retry.",
+                    "error:".red()
+                );
+                config_snapshot.restore_after_failure();
+                return 1;
+            }
+        }
+        Some(ManifestState::Malformed(_)) => unreachable!("update rejects malformed manifests"),
+        None => populate_manifest_hash_fields(&mut lockfile),
+    }
 
     if let Err(e) = lockfile.write_to(lock_path) {
         eprintln!("{} {}", "error:".red(), e);
@@ -1760,16 +1826,13 @@ pub(crate) async fn prepare_manifest_dependencies(
         let graph = match fetch_resolved_worker_graph(name, Some(range.as_str()), None).await {
             Ok(g) => g,
             Err(e) => {
-                // If the declared range is a prerelease, preempt the common
-                // confusion: the default registry resolver filters to stable
-                // versions, so a published prerelease looks "not found."
+                // Unpromoted prerelease ranges can look "not found".
                 let hint = semver::VersionReq::parse(range)
                     .ok()
                     .filter(|req| req.comparators.iter().any(|c| !c.pre.is_empty()))
                     .map(|_| {
-                        " (note: the registry filters prereleases by default; \
-                         configure the registry to expose prereleases if this \
-                         range is intentional)"
+                        " (note: unpromoted prerelease ranges may not resolve; \
+                         use a promoted exact version or dist-tag)"
                     })
                     .unwrap_or("");
                 return Err(format!(
@@ -5724,7 +5787,8 @@ workers:
     }
 
     #[tokio::test]
-    async fn handle_worker_sync_frozen_passes_when_hash_matches() {
+    #[allow(clippy::await_holding_lock)] // Keep the offline registry URL isolated while syncing.
+    async fn handle_worker_sync_frozen_replays_tag_pin_without_registry() {
         // A fresh lock written by Lane A carries manifest_hash +
         // declared_dependencies. When the cwd manifest agrees, --frozen
         // falls through to verify, which in turn passes because config.yaml
@@ -5738,11 +5802,11 @@ workers:
 
             let manifest = r#"name: my-project
 dependencies:
-  alpha: "^1.0.0"
+  alpha: latest
 "#;
             std::fs::write(dir.join("iii.worker.yaml"), manifest).unwrap();
 
-            let declared = BTreeMap::from([("alpha".to_string(), "^1.0.0".to_string())]);
+            let declared = BTreeMap::from([("alpha".to_string(), "latest".to_string())]);
             let mut lock = WorkerLockfile {
                 manifest_hash: Some(compute_manifest_hash(&declared)),
                 declared_dependencies: Some(declared),
@@ -5761,6 +5825,8 @@ dependencies:
             );
             lock.write_to(&dir.join("iii.lock")).unwrap();
 
+            let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
+            let _api_guard = set_env_var_for_test("III_API_URL", "http://127.0.0.1:1");
             let rc = handle_worker_sync(true).await;
             assert_eq!(rc, 0);
         })
@@ -6161,6 +6227,154 @@ dependencies:
             let rc = handle_worker_verify(true).await;
 
             assert_eq!(rc, 1);
+
+            lock.workers.get_mut("root-worker").unwrap().dependencies =
+                [("helper".to_string(), "beta".to_string())].into();
+            lock.write_to(cli_lockfile::lockfile_path()).unwrap();
+            assert_eq!(handle_worker_verify(true).await, 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // The process-wide registry URL must stay isolated through async requests.
+    async fn handle_worker_update_resolves_all_declared_tags_before_rehashing() {
+        in_temp_dir_async(|dir| async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
+            let manifest = "name: project\ndependencies:\n  helper: beta\n  leaf: next\n";
+            std::fs::write(
+                "iii.worker.yaml",
+                manifest,
+            )
+            .unwrap();
+            let declared = BTreeMap::from([
+                ("helper".to_string(), "beta".to_string()),
+                ("leaf".to_string(), "next".to_string()),
+            ]);
+            let previous = BTreeMap::from([
+                ("helper".to_string(), "beta".to_string()),
+                ("leaf".to_string(), "latest".to_string()),
+            ]);
+            let mut lock = cli_lockfile::WorkerLockfile {
+                manifest_hash: Some(super::super::sync::compute_manifest_hash(&previous)),
+                declared_dependencies: Some(previous.clone()),
+                ..Default::default()
+            };
+            lock.workers.insert(
+                "helper".to_string(),
+                cli_lockfile::LockedWorker {
+                    version: "1.0.0".to_string(),
+                    worker_type: cli_lockfile::LockedWorkerType::Engine,
+                    dependencies: [("leaf".to_string(), "latest".to_string())].into(),
+                    source: None,
+                },
+            );
+            lock.workers.insert(
+                "leaf".to_string(),
+                cli_lockfile::LockedWorker {
+                    version: "1.0.0".to_string(),
+                    worker_type: cli_lockfile::LockedWorkerType::Engine,
+                    dependencies: Default::default(),
+                    source: None,
+                },
+            );
+            lock.write_to(&dir.join("iii.lock")).unwrap();
+
+            assert_eq!(handle_worker_update(Some("helper")).await, 1);
+            let unchanged = cli_lockfile::WorkerLockfile::read_from(&dir.join("iii.lock")).unwrap();
+            assert_eq!(unchanged.declared_dependencies, Some(previous));
+            assert_eq!(handle_worker_sync(true).await, 1);
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let _api_guard = set_env_var_for_test(
+                "III_API_URL",
+                format!("http://{}", listener.local_addr().unwrap()),
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let server = tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 4096];
+                    loop {
+                        let n = stream.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&request[..header_end]);
+                            let content_length = headers
+                                .lines()
+                                .find_map(|line| line.strip_prefix("content-length: "))
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if request.len() >= header_end + 4 + content_length {
+                                break;
+                            }
+                        }
+                    }
+                    if request.starts_with(b"POST /resolve ") {
+                        let body_start = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&request[body_start..]).unwrap();
+                        let root = body["worker"].as_str().unwrap();
+                        if root == "helper" {
+                            std::fs::write(
+                                "iii.worker.yaml",
+                                "name: project\ndependencies:\n  helper: next\n  leaf: next\n",
+                            )
+                            .unwrap();
+                        }
+                        let leaf = serde_json::json!({
+                            "name": "leaf", "type": "engine", "version": "2.0.0",
+                            "repo": "https://example.com/leaf", "dependencies": {}
+                        });
+                        let (nodes, edges) = if root == "helper" {
+                            (
+                                vec![leaf, serde_json::json!({
+                                    "name": "helper", "type": "engine", "version": "2.0.0",
+                                    "repo": "https://example.com/helper", "dependencies": {"leaf": "next"}
+                                })],
+                                vec![serde_json::json!({"from": "helper", "to": "leaf", "range": "next"})],
+                            )
+                        } else {
+                            (vec![leaf], Vec::new())
+                        };
+                        let graph = serde_json::to_vec(&serde_json::json!({
+                            "root": { "name": root, "version": "2.0.0" },
+                            "graph": nodes,
+                            "edges": edges
+                        }))
+                        .unwrap();
+                        tx.send(body).unwrap();
+                        stream
+                            .write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n", graph.len()).as_bytes())
+                            .await
+                            .unwrap();
+                        stream.write_all(&graph).await.unwrap();
+                    } else {
+                        stream.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n").await.unwrap();
+                    }
+                }
+            });
+
+            assert_eq!(handle_worker_update(None).await, 0);
+            assert_eq!(rx.recv().await.unwrap()["version"], "beta");
+            assert_eq!(rx.recv().await.unwrap()["version"], "next");
+            let updated = cli_lockfile::WorkerLockfile::read_from(&dir.join("iii.lock")).unwrap();
+            assert_eq!(updated.workers["helper"].version, "2.0.0");
+            assert_eq!(updated.workers["leaf"].version, "2.0.0");
+            assert_eq!(updated.declared_dependencies, Some(declared.clone()));
+            assert_eq!(
+                updated.manifest_hash,
+                Some(super::super::sync::compute_manifest_hash(&declared))
+            );
+            server.abort();
+            assert_eq!(handle_worker_sync(true).await, 1);
+            std::fs::write("iii.worker.yaml", manifest).unwrap();
+            assert_eq!(handle_worker_sync(true).await, 0);
         })
         .await;
     }
@@ -7427,7 +7641,7 @@ dependencies:
         );
         let err = result.unwrap_err();
         assert!(
-            !err.contains("filters prereleases"),
+            !err.contains("unpromoted prerelease ranges"),
             "stable range must not emit the prerelease hint; got: {err}"
         );
     }
@@ -7445,7 +7659,7 @@ dependencies:
         }
         let err = result.unwrap_err();
         assert!(
-            err.contains("filters prereleases"),
+            err.contains("unpromoted prerelease ranges"),
             "prerelease range must trigger the registry-filter hint; got: {err}"
         );
     }

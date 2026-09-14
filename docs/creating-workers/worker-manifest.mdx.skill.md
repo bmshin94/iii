@@ -154,23 +154,24 @@ When neither is set, the worker registers in the `default` namespace.
 
 ## `dependencies`
 
-Map of `<worker-name>: <semver range>` declaring other workers this worker depends on, resolved
+Map of `<worker-name>: <semver range or dist-tag>` declaring other workers this worker depends on, resolved
 against the registry.
 
 ```yaml
 dependencies:
   http: "^0.20"
-  state: "^0.20"
+  state: latest
 ```
 
 Rules:
 
 - Each name must satisfy the registry's worker-name validation.
-- Each range must be a valid semver version requirement (for example `^1.2`, `~0.5.0`, `>=2 <3`).
+- Each selector must be a semver range (for example `^1.2`, `~0.5.0`) or an npm-style dist-tag such as `latest`, `next`, or `beta`.
+- Tags resolve to concrete versions in `iii.lock`. `iii worker sync --frozen` reuses the locked version; `iii worker update` resolves the tag again.
 - Duplicate keys are an error.
 - A worker cannot depend on itself.
-- Prerelease ranges are accepted syntactically, but the default registry resolver serves only stable
-  versions, so a prerelease range surfaces as `version_not_found` at resolve time.
+- Ranges select stable versions by default. A prerelease range can return `version_not_found` unless
+  matching candidates are promoted; exact versions and dist-tags can select prereleases.
 
 ## `resources`
 

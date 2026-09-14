@@ -20,7 +20,7 @@ use super::lockfile::MANIFEST_HASH_PREFIX;
 /// Compute the canonical hash of a declared-dependency set.
 ///
 /// The input is the parser output from `worker_manifest_deps::parse_dependencies`
-/// — a sorted `BTreeMap<String, String>` of `name → semver-range`. Serialization
+/// — a sorted `BTreeMap<String, String>` of `name → semver-range-or-tag`. Serialization
 /// is explicit and whitespace-stable: one line per entry, `"{name}={range}\n"`.
 /// YAML quoting, comments, and key ordering in the source file are normalized
 /// away by the parser before they reach this function, so a `yamlfmt` round-trip

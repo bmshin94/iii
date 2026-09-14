@@ -290,12 +290,9 @@ impl WorkerLockfile {
                         "{LOCKFILE_NAME} declared dependency `{name}` has empty range"
                     ));
                 }
-                semver::VersionReq::parse(trimmed).map_err(|e| {
-                    format!(
-                        "{LOCKFILE_NAME} declared dependency `{name}` has invalid \
-                         semver range `{range}`: {e}"
-                    )
-                })?;
+                super::worker_manifest_deps::validate_dependency_selector(trimmed).map_err(
+                    |e| format!("{LOCKFILE_NAME} declared dependency `{name}` has invalid selector `{range}`: {e}"),
+                )?;
             }
 
             // Cross-check: when both fields are present they must be
@@ -1002,8 +999,8 @@ workers:
     #[test]
     fn declared_dependencies_roundtrip_with_entries() {
         let declared = BTreeMap::from([
-            ("alpha".to_string(), "^1.0".to_string()),
-            ("beta".to_string(), "~2.0".to_string()),
+            ("alpha".to_string(), "latest".to_string()),
+            ("beta".to_string(), "beta".to_string()),
         ]);
         // Validation requires manifest_hash and declared_dependencies
         // to be paired and consistent. Compute the hash from the

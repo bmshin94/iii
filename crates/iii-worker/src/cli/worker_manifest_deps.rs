@@ -11,17 +11,11 @@ use std::collections::BTreeMap;
 /// Parse the `dependencies:` field from an already-loaded YAML document.
 /// Returns an empty map when the field is absent. Returns `Err` when the
 /// field exists but is malformed (not a mapping, empty keys, invalid
-/// semver range, worker name with disallowed characters, or self-reference
+/// semver range or dist-tag, worker name with disallowed characters, or self-reference
 /// when `self_name` is `Some`).
 ///
-/// NOTE on prerelease ranges: this parser accepts any valid semver range,
-/// including prereleases like `1.0.0-beta.1` or `^1.2.0-rc.0`. The default
-/// iii registry resolver filters candidates to stable versions only
-/// (`../registry/api/src/services/resolver.service.ts:222`), so declaring a
-/// prerelease range will surface as a `version_not_found` error at
-/// `/resolve` time even when the prerelease is actually published. This is
-/// intentional — author declarations stay forward-compatible with any
-/// registry that chooses to expose prereleases.
+/// Prerelease ranges are syntactically accepted; unpromoted prerelease
+/// candidates may still return `version_not_found` from the registry.
 pub fn parse_dependencies(
     doc: &serde_yaml::Value,
     self_name: Option<&str>,
@@ -35,7 +29,7 @@ pub fn parse_dependencies(
     }
 
     let mapping = field.as_mapping().ok_or_else(|| {
-        "`dependencies` must be a mapping of worker-name -> semver range".to_string()
+        "`dependencies` must be a mapping of worker-name -> semver range or dist-tag".to_string()
     })?;
 
     let mut out = BTreeMap::new();
@@ -46,7 +40,9 @@ pub fn parse_dependencies(
             .trim();
         let range = v
             .as_str()
-            .ok_or_else(|| format!("`dependencies.{name}` must be a string semver range"))?
+            .ok_or_else(|| {
+                format!("`dependencies.{name}` must be a string semver range or dist-tag")
+            })?
             .trim();
 
         if name.is_empty() {
@@ -57,9 +53,8 @@ pub fn parse_dependencies(
         }
         super::registry::validate_worker_name(name)
             .map_err(|e| format!("invalid dependency key `{name}`: {e}"))?;
-        semver::VersionReq::parse(range).map_err(|e| {
-            format!("invalid semver range for dependency `{name}`: `{range}` ({e})")
-        })?;
+        validate_dependency_selector(range)
+            .map_err(|e| format!("invalid dependency `{name}` selector `{range}`: {e}"))?;
         if let Some(self_name) = self_name
             && name == self_name
         {
@@ -73,6 +68,28 @@ pub fn parse_dependencies(
     }
 
     Ok(out)
+}
+
+/// npm dist-tags use URI-safe names and cannot be interpreted as semver ranges.
+/// Rust's semver parser omits npm's `v` prefix, so check that form separately.
+pub(crate) fn is_dependency_tag(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&c))
+        && semver::VersionReq::parse(value).is_err()
+        && value
+            .strip_prefix('v')
+            .is_none_or(|version| semver::VersionReq::parse(version).is_err())
+}
+
+pub(crate) fn validate_dependency_selector(value: &str) -> Result<(), String> {
+    if semver::VersionReq::parse(value).is_ok() || is_dependency_tag(value) {
+        Ok(())
+    } else {
+        Err("expected a semver range or npm-compatible dist-tag".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -101,6 +118,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_dist_tags() {
+        let doc = yaml(
+            "name: caller\ndependencies:\n  math-worker: latest\n  iii-http: beta.2\n  custom: not-a-range\n",
+        );
+        let deps = parse_dependencies(&doc, Some("caller")).unwrap();
+        assert_eq!(deps.get("math-worker").unwrap(), "latest");
+        assert_eq!(deps.get("iii-http").unwrap(), "beta.2");
+        assert_eq!(deps.get("custom").unwrap(), "not-a-range");
+    }
+
+    #[test]
     fn rejects_non_mapping() {
         let doc = yaml("name: caller\ndependencies: \"nope\"\n");
         let err = parse_dependencies(&doc, Some("caller")).unwrap_err();
@@ -116,9 +144,10 @@ mod tests {
 
     #[test]
     fn rejects_invalid_range() {
-        let doc = yaml("name: caller\ndependencies:\n  math-worker: \"not-a-range\"\n");
+        let doc = yaml("name: caller\ndependencies:\n  math-worker: \"bad/tag\"\n");
         let err = parse_dependencies(&doc, Some("caller")).unwrap_err();
-        assert!(err.contains("invalid semver range"), "got: {err}");
+        assert!(err.contains("invalid dependency"), "got: {err}");
+        assert!(validate_dependency_selector("v1.4").is_err());
     }
 
     #[test]

@@ -259,16 +259,16 @@ fn concurrent_reader_never_sees_partial_write() {
 // 4. Lockfile validation (correct behavior expected — bugs fixed)
 // ---------------------------------------------------------------------------
 
-/// **Bug fix**: ranges in `declared_dependencies` must parse as semver.
+/// **Bug fix**: selectors in `declared_dependencies` must be valid semver ranges or dist-tags.
 /// The manifest parser enforces this; the lockfile parser must too, so
 /// hand-edited locks can't smuggle garbage past validation.
 #[test]
 fn lockfile_rejects_garbage_declared_dependency_range() {
     // Hash + declared_dependencies must be paired (see fix below); the
-    // hash here doesn't need to match because the semver check fires
+    // hash here doesn't need to match because selector validation fires
     // first.
     let yaml = format!(
-        "version: 1\nmanifest_hash: \"{prefix}{hex}\"\ndeclared_dependencies:\n  alpha: \"this-is-not-semver-at-all\"\nworkers: {{}}\n",
+        "version: 1\nmanifest_hash: \"{prefix}{hex}\"\ndeclared_dependencies:\n  alpha: \"bad/tag\"\nworkers: {{}}\n",
         prefix = MANIFEST_HASH_PREFIX,
         hex = "0".repeat(64),
     );

@@ -85,7 +85,7 @@ pub struct WorkerManifest {
     pub env: Option<BTreeMap<String, String>>,
 
     #[schemars(
-        description = "Optional map of other-worker-name -> semver range, resolved against the registry and installed before this worker, e.g. { iii-state: \"^0.19\" }. No self-references."
+        description = "Optional map of other-worker-name -> semver range or dist-tag, resolved against the registry and installed before this worker, e.g. { iii-state: \"latest\" }. No self-references."
     )]
     pub dependencies: Option<BTreeMap<String, String>>,
 
@@ -818,8 +818,11 @@ mod tests {
         let r = report("name: w\nscripts:\n  start: x\ndependencies:\n  w: \"^1\"\n");
         assert!(r.errors.iter().any(|e| e.contains("itself")), "got: {r:?}");
 
-        let r = report("name: w\nscripts:\n  start: x\ndependencies:\n  other: \"not-a-range\"\n");
-        assert!(r.errors.iter().any(|e| e.contains("semver")), "got: {r:?}");
+        let r = report("name: w\nscripts:\n  start: x\ndependencies:\n  other: \"bad/tag\"\n");
+        assert!(
+            r.errors.iter().any(|e| e.contains("selector")),
+            "got: {r:?}"
+        );
     }
 
     #[test]
