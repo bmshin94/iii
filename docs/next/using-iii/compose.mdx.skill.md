@@ -31,6 +31,7 @@ iii compose [OPTIONS]
 | `--engine <URL>`       | Existing engine WebSocket address. Overrides the compose file and III_URL. The local default is used when none of them supplies a URL                    |
 | `-n, --namespace <NS>` | Namespace this daemon answers `compose::*` in and applies to every project it loads. Several daemons attach to one engine; this is what tells them apart |
 | `--up`                 | Serve with one project brought up first, starting its declared engine unless `--engine` selects an existing one                                          |
+| `--frozen`             | With `--up`, require the compose file and existing lock to match and skip package resolution                                                              |
 | `-f, --file <PATH>`    | The compose file. Only valid with `--up`. Defaults to `./worker-compose.yaml`, the same fallback `compose::up` uses when a call names no file            |
 
 `Ctrl^C`, `SIGINT` and `SIGTERM` all gracefully stop the daemon, every worker run by the daemon, and
@@ -40,9 +41,34 @@ this operation.
 
 `compose::*` functions as documented below are the intended way to manage a running compose daemon.
 
+### Process names on Linux
+
+Compose includes its resolved namespace in the process label. The daemon uses `iii:c:<namespace>`,
+and an engine started by that daemon uses `iii:e:<namespace>`. The namespace comes from
+`--namespace`, then `namespace:` in the compose file, then `default`.
+
+For example, `iii compose --namespace orders --up` produces these labels when it starts an engine:
+
+```text
+iii:c:orders
+  +-- iii:e:orders
+```
+
+Use `ps -p <PID> -o pid,ppid,comm,args` to inspect both fields. The `args` field retains the full
+namespace and the original command arguments. Linux limits `comm` to 15 bytes, so namespaces longer
+than nine characters use their first two characters, `~`, and six hexadecimal hash characters in
+that field. Use `args` to read the full namespace when a short label is abbreviated.
+
+The daemon sets its command label through an early re-exec with the same PID, before starting
+the runtime or any children. Existing external engines keep their names. On other operating
+systems, process names retain their previous behavior.
+
 ### Compose logs
 
-Compose logs stdout and stderr output from started workers to `$HOME/.iii/compose/namespace/`.
+Compose logs stdout and stderr output from started workers to `logs/` in the state directory.
+The default state directory is `<project-dir>/.iii/compose/<namespace>/`. When `III_COMPOSE_STATE_DIR`
+is set, it is `$III_COMPOSE_STATE_DIR/<project-slug>/<namespace>/`. The managed engine writes to
+`engine.log` in that same state directory.
 
 Logs are rotated every 10 MiB. Compose keeps up to 40 MiB of logs. Compose strips terminal control
 sequences before persisting the engine output.
@@ -109,7 +135,7 @@ with it and making basic changes to the `worker-compose.yaml` file.
 
 | Function             | Takes                                                       | Returns                                                                    |
 | -------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `compose::up`        | `file`, `container`                                         | A concise [mutation outcome](#mutation-outcomes).                          |
+| `compose::up`        | `file`, `container`, `frozen`                               | A concise [mutation outcome](#mutation-outcomes).                          |
 | `compose::down`      | `file`, `container`                                         | A concise [mutation outcome](#mutation-outcomes).                          |
 | `compose::status`    | `file`                                                      | The project's namespace, file, state directory, daemon pid, worker states. |
 | `compose::logs`      | `file`, `container`, `cursors`, `tail`, `stream`, `wait_ms` | Bounded stdout/stderr entries and one cursor per worker.                   |
@@ -131,6 +157,7 @@ absolute path as well.
 
 ```bash
 iii trigger compose::up      --namespace dev file=./worker-compose.yaml
+iii trigger compose::up      --namespace dev file=./worker-compose.yaml frozen=true
 iii trigger compose::up      --namespace dev file=./worker-compose.yaml container=api
 iii trigger compose::status  --namespace dev file=./worker-compose.yaml
 iii trigger compose::logs    --namespace dev file=./worker-compose.yaml worker=api tail=100
@@ -151,15 +178,16 @@ iii trigger compose::stop    --namespace dev
 full reconciliation state. Full worker state stays available through
 [`compose::status`](#checking-status), and process output through [`compose::logs`](#viewing-logs).
 
-| Field              | Description                                                                    |
-| ------------------ | ------------------------------------------------------------------------------ |
-| `status`           | `ok` or `failed`.                                                              |
-| `changed`          | `true` when the call changed anything.                                         |
-| `worker`           | The primary worker a targeted mutation named. Absent for whole-project calls.  |
-| `workers`          | Every explicitly requested worker, present when more than one was supplied.    |
-| `version`          | The resolved package version, when the mutation resolves one.                  |
-| `affected_workers` | Other workers the mutation had to change, such as restarted dependents.        |
-| `error`            | The first worker failure, as a stable `code` and a sanitized `message`.        |
+| Field                   | Description                                                                    |
+| ----------------------- | ------------------------------------------------------------------------------ |
+| `status`                | `ok` or `failed`.                                                              |
+| `changed`               | `true` when the call changed anything.                                         |
+| `worker`                | The primary worker a targeted mutation named. Absent for whole-project calls.  |
+| `workers`               | Every explicitly requested worker, present when more than one was supplied.    |
+| `version`               | The resolved package version, when the mutation resolves one.                  |
+| `affected_workers`      | Other workers the mutation had to change, such as restarted dependents.        |
+| `error`                 | The first worker failure, as a stable `code` and a sanitized `message`.        |
+| `not_required_failures` | Workers that failed while the operation still succeeded, which is only possible for a container whose effective `required` value is `false`. |
 
 Optional fields are omitted from the response when they do not apply.
 
@@ -177,8 +205,9 @@ in the request to choose the id yourself. A caller-selected id lets you bind a p
 before submitting the mutation, so no event can be missed. An id that is already in use is refused
 with `OPERATION_ID_ALREADY_EXISTS`.
 
-A call that names no workers reconciles the file in place and returns a
-[mutation outcome](#mutation-outcomes) directly.
+An add or remove that names no workers reconciles the file in place and returns a
+[mutation outcome](#mutation-outcomes) directly. A bare update is admitted like any other
+operation, because it updates every declared package worker.
 
 #### Completion events
 
@@ -221,15 +250,97 @@ iii trigger compose::cancel    --namespace dev operation_id=deploy-42
 `compose::up` starts every worker in the compose file, in dependency order. Workers that are already
 ready stay as they are.
 
-| Field       | Description                                                         |
-| ----------- | ------------------------------------------------------------------- |
-| `file`      | The project to start.                                               |
-| `container` | Starts that worker and the workers it depends on, and nothing else. |
+| Field       | Description                                                                                  |
+| ----------- | -------------------------------------------------------------------------------------------- |
+| `file`      | The project to start.                                                                        |
+| `container` | Starts that worker and the workers it depends on, and nothing else.                          |
+| `frozen`    | Requires a current `worker-compose.lock` and does not resolve package selectors when `true`. |
 
 #### compose::up failures
 
-A project that fails to start due to a project-related issue ends the command with
-`PROJECT_DID_NOT_START`. Partial starts are rolled back in reverse dependency order.
+A worker is not required by default. If it fails to start, its failure is reported against that
+worker, nothing is rolled back, and the operation still returns `ok`. Workers that name it in
+`start_after` start anyway, because `start_after` is a start order and not a claim that the dependent
+cannot run without it. The response lists every worker that failed this way in
+`not_required_failures`. A response with `status: ok` has no top-level `error`; that field is present
+only when the operation returns `status: failed`.
+
+Set `required: true` when a worker must fail the operation:
+
+```yaml
+containers:
+  database:
+    worker: path://./workers/database
+    required: true
+```
+
+A required failure ends the command with `PROJECT_DID_NOT_START`. Partial starts are rolled back in
+reverse dependency order.
+
+Use `required_default` to change the fallback for all containers in the file. An explicit container
+value wins over the file value:
+
+```yaml
+required_default: true
+
+containers:
+  queue:
+    worker: package://queue
+    version: "0.21.9"
+    required: false
+  state:
+    worker: package://state
+    version: "0.22.5-rc.1"
+```
+
+In this example, `state` inherits `required_default: true`, while `queue` remains false. If both
+fields are absent, the effective value is false.
+
+#### Retrying a worker that fails
+
+By default, a failed first start settles immediately. A worker that exits after it was ready takes
+its dependents down with it and stays down. To retry either case, declare a restart policy:
+
+```yaml
+containers:
+  api:
+    worker: path://./workers/api
+    restart: on-failure
+```
+
+`no` is the default. `on-failure` retries a failed start or a worker that exits with a non-zero
+status. `always` also restarts it when it exits successfully after it was ready.
+
+The short form uses five attempts, a 500ms base delay, a 30-second maximum delay, and a 60-second
+stability window. Use the object form to change these values for one worker:
+
+```yaml
+containers:
+  api:
+    worker: path://./workers/api
+    restart:
+      condition: on-failure
+      delay: 500ms
+      max_delay: 30s
+      max_attempts: 5
+      window: 60s
+```
+
+| Field | Description | Default |
+| ----- | ----------- | ------- |
+| `condition` | Required in the object form. Accepts `no`, `on-failure`, or `always`. | `no` in the short form |
+| `delay` | Base delay for exponential backoff after a replacement fails. | `500ms` |
+| `max_delay` | Maximum delay between replacement attempts. | `30s` |
+| `max_attempts` | Maximum replacement attempts after the original process fails. | `5` |
+| `window` | Time a ready worker must stay active before its run-time attempt budget resets. | `60s` |
+
+The first replacement is immediate. If it fails, later attempts use exponential backoff from
+`delay` up to `max_delay`. During `up`, the progress row shows the current attempt and wait. For a
+run-time exit, only the named worker bounces: workers that name it in `start_after` keep running and
+see their connection drop and reconnect. `compose::status` reports the worker as `restarting` while
+it waits for a run-time replacement. Once `max_attempts` is spent, `required` controls whether the
+startup operation fails. At run time, the worker is marked `failed`, its dependents are stopped, and
+`last_error` says the supervisor gave up.
 
 ### Stopping a project
 
@@ -247,22 +358,106 @@ and reconciles the project once. On the CLI, repeat `worker=` for each worker. E
 registry package name (`state`), a package name with a version (`state@0.21.4`), or a directory
 (`./workers/api`).
 
-A JSON payload for this function can use a single list: `{ "workers": ["database", "web"] }`.
+A JSON payload can mix worker names and container objects in the same list. Each object accepts
+the container fields from `worker-compose.yaml`. The container key comes from the last part of
+the worker name or directory path.
 
-| Field          | Description                                                             |
-| -------------- | ------------------------------------------------------------------------ |
-| `file`         | The project to edit.                                                    |
-| `workers`      | The canonical JSON list of workers to declare.                          |
-| `worker`       | One worker. Repeatable on the CLI.                                      |
-| `operation_id` | A caller-selected id for the [operation](#observable-operations).       |
+```bash
+iii trigger compose::add --namespace dev file=./worker-compose.yaml --json '{
+  "workers": [
+    "database",
+    {
+      "worker": "./workers/api",
+      "start_after": ["database"],
+      "scripts": {
+        "pre_run": "pnpm build",
+        "pre_run_timeout": "60s",
+        "run": "pnpm start",
+        "post_run": "echo stopped"
+      },
+      "config_name": "api",
+      "config_override": { "port": 3000 },
+      "working_dir": "./workers/api",
+      "environment": { "NODE_ENV": "development" },
+      "env_file": ["./api.env"],
+      "startup_timeout": "30s"
+    }
+  ]
+}'
+```
+
+| Field          | Description                                                       |
+| -------------- | ------------------------------------------------------------------ |
+| `file`         | The project to edit.                                              |
+| `workers`      | A JSON list of worker names or container objects.                 |
+| `worker`       | One worker. Repeatable on the CLI.                                |
+| `operation_id` | A caller-selected id for the [operation](#observable-operations). |
 
 The call returns as soon as the operation is accepted. Follow it through
 [completion events](#completion-events) or [`compose::operation`](#checking-and-cancelling-an-operation).
 
-An package without a version specified will pin to the latest available version (ex. `0.23.1`).
+A container object accepts these fields:
 
-Workers whose declarations did not change remain running. Existing workers whose resolved versions
-changed restart in place, and newly declared workers start through the normal dependency plan.
+| Field | Description |
+| ----- | ----------- |
+| `worker` | Required. A package name, `name@version`, registry reference, or local path. Also accepts `package://` and `path://` sources. |
+| `version` | Package version. Must agree with a version included in `worker`. |
+| `start_after` | Container keys to start first. Compose adds the package's resolved dependencies to this list. |
+| `scripts` | `pre_run`, `pre_run_timeout`, `run`, and `post_run`. `run` is valid only for local workers. |
+| `config_name` | Name of the worker's base configuration. |
+| `config_override` | Configuration value applied over the base configuration. |
+| `working_dir` | Working directory, relative to the compose file. |
+| `environment` | Environment variables with string values. |
+| `env_file` | List of environment file paths, relative to the compose file. |
+| `startup_timeout` | Maximum wait for worker registration, such as `30s`. |
+
+A package without a version pins to the latest available version, for example `0.23.1`. An explicit
+selector such as `state@next` stays as `next` in `worker-compose.yaml`.
+Unknown fields and invalid field types are rejected. Compose validates the complete edited file
+before it writes any changes.
+
+For an existing container, omitted fields other than `version` keep their values. A supplied field replaces that entire
+field, including maps such as `scripts`, `environment`, and `config_override`. Use `{}` or `[]` to
+clear maps or lists. An omitted `start_after` keeps existing dependencies; a supplied list replaces
+them and includes any required package dependencies.
+
+Workers whose declarations did not change remain running. Existing workers whose source, version,
+dependencies, or settings changed restart in place. Newly declared workers start through the normal
+dependency plan. If the resolved declaration already matches the file, the call makes no file
+changes and causes no restart.
+
+An add keeps the pins of dependencies that are already declared in the file, even when the registry
+resolves a newer version for them. Only the workers you name in the call move their pins; use
+[`compose::update`](#updating-workers) to move the rest. An add plans against a snapshot of the
+compose file and only edits the file it planned against. A file that keeps changing while the add
+resolves its graph fails the call with `ADD_PLAN_STALE` and writes nothing; retry the add.
+
+### Package lock
+
+Compose writes `worker-compose.lock` beside `worker-compose.yaml`. The compose file keeps the
+requested selector. The lock keeps the resolved dependency graph, versions, package types,
+artifact URLs, SHA-256 digests, and default configuration returned by the registry.
+
+```text
+worker-compose.yaml: next
+          |
+          v
+worker-compose.lock: 0.22.8 + SHA-256
+          |
+          v
+package cache: verified artifact
+```
+
+Normal starts and restarts use the lock without resolving `next` again. If the cache is empty,
+Compose downloads the URL in the lock and verifies its SHA-256 digest. Compose also verifies the
+extracted cache contents before reuse. A changed cache entry is downloaded again from the locked
+URL.
+
+Use `iii compose build --frozen` in CI to require the compose file and lock to match. Use
+`iii compose --up --frozen` or `compose::up frozen=true` to apply the same rule during startup.
+Frozen mode never resolves selectors or changes the lock. It can download a missing artifact only
+from the URL already in the lock. Commit the lock so development, CI, and deployments use the same
+package content.
 
 ### Removing workers
 
@@ -299,25 +494,47 @@ approximately the equivalent of `compose::down` followed by `compose::up`.
 
 ### Updating workers
 
-`compose::update worker=state` updates a worker to either the current `latest` version when no
-version is specified or to the target version when it is. On the CLI, repeat `worker=` for each
-worker; a JSON payload can use a single `workers` list.
+`compose::update` without `worker` or `workers` updates every declared `package://` worker to its
+registry's latest version. It keeps each worker's registry reference and skips `path://` workers.
 
-If the requested version is already installed this operation is treated as a NOOP.
+```bash
+iii trigger compose::update
+iii trigger compose::update file=worker-compose.yaml
+```
+
+`compose::update worker=state` resolves the selector already in the compose file. A tag such as
+`next`, a range, and an exact version all remain unchanged in the file. Use
+`worker=state@<selector>` to change the selector. For example, use `worker=state@latest` to move an
+exact version to the registry's latest channel.
+
+Update resolves the complete dependency graph. It adds new dependencies, updates changed
+dependencies, and removes stale dependencies that Compose generated and no remaining package root
+uses. Manually declared workers are not removed.
+
+Compose downloads and verifies the new artifact before it changes the lock or stops a worker. A
+failed resolve or download leaves the prior lock and running workers unchanged. If the resolved
+artifact and default configuration did not change, Compose updates lock metadata when needed and
+does not restart the project.
+
+If all selected workers already use the requested versions, the operation leaves the file and
+running processes unchanged. A project with only `path://` workers also stays unchanged.
 
 | Field          | Description                                                       |
 | -------------- | ------------------------------------------------------------------ |
 | `file`         | The project to edit.                                              |
-| `workers`      | The canonical JSON list of worker specs to update.                |
-| `worker`       | One worker spec: `name` or `name@version`. Repeatable on the CLI. |
+| `worker`       | Optional worker spec: `name` or `name@version`.                   |
+| `workers`      | Optional non-empty list of specs. Takes precedence over `worker`. |
 | `operation_id` | A caller-selected id for the [operation](#observable-operations). |
 
-The call returns as soon as the operation is accepted. Follow it through
-[completion events](#completion-events) or [`compose::operation`](#checking-and-cancelling-an-operation).
+The call returns as soon as the operation is accepted, whether it names workers or updates every
+declared package worker. Follow it through [completion events](#completion-events) or
+[`compose::operation`](#checking-and-cancelling-an-operation).
 
 ```text
-worker=state            the version the registry calls latest
+worker=state            resolve the selector already declared in the compose file
 worker=state@0.21.4     that version, which is also how a downgrade is spelled
+worker=state@next       the version currently selected by the next tag
+worker=state@latest     the version currently selected by the latest tag
 ```
 
 The worker has to be declared already in order to be updated, and it has to be a `package://`. Use
@@ -326,22 +543,24 @@ The worker has to be declared already in order to be updated, and it has to be a
 Workers specified with `path://` are not versioned, any updates to these workers will be reflected
 the next time the worker is restarted.
 
-<Note>Unlike `compose::restart worker=state`, an update restarts the whole project.</Note>
+<Note>An update that changes package content or graph topology restarts the whole project once.</Note>
 
 ### Checking status
 
-`compose::status` reports each declared worker with its `state`, its `pid`, an `owned` flag, its
-rotating `log_path`, and `last_error` when there is one. `owned` is `false` for a worker this daemon
-has knowledge of but does not manage (ie. was not started by the compose daemon).
+`compose::status` reports each declared worker with its `state`, the active process `pid` when one
+exists, an `owned` flag, its rotating `log_path`, and `last_error` when there is one. `owned` is
+`false` for a worker this daemon has knowledge of but does not manage (ie. was not started by the
+compose daemon).
 
 #### Worker states
 
-| State      | Meaning                                                    |
-| ---------- | ---------------------------------------------------------- |
-| `starting` | Spawned. The engine has not registered it yet.             |
-| `ready`    | Registered in the engine under `(namespace, container)`.   |
-| `failed`   | Exited without being asked to, or one of its hooks failed. |
-| `stopped`  | Stopped by this daemon.                                    |
+| State        | Meaning                                                                                       |
+| ------------ | --------------------------------------------------------------------------------------------- |
+| `starting`   | Spawned. The engine has not registered it yet.                                                |
+| `ready`      | Registered in the engine under `(namespace, container)`.                                      |
+| `restarting` | Waiting for the next configured retry. No process or PID is active.                           |
+| `failed`     | Exited unsuccessfully with no eligible retry, exhausted its retries, or one of its hooks failed. |
+| `stopped`    | Stopped by the daemon, or exited successfully without an eligible restart.                    |
 
 ### Viewing logs
 
@@ -389,6 +608,10 @@ not resolved.
 started with (`--up`). The compose daemon will also exit. Before exiting the daemon will return its
 name, pid, and the projects it is about to stop.
 
+`compose::stop` takes no target. A request that names a `container` or `worker` is refused with
+`STOP_TAKES_NO_CONTAINER` instead of stopping the whole daemon. Use
+`compose::down container=<name>` to stop one container.
+
 <Warning>
   There is no `compose::start` equivalent to `compose::stop`. Stopping a compose daemon means it
   must be restarted from the server it is running on.
@@ -411,17 +634,11 @@ iii trigger compose::schema --namespace dev function_id=compose::up
 iii trigger compose::schema --namespace dev function_id=worker-compose.yaml
 ```
 
-## Namespaces
+## Configure a namespace
 
-Namespaces are used to allow advanced architectures that require more than one running copy of a
-given worker, multi-tenancy, some multi-agent workflows, and various isolation schemes between
-different parts of a iii application.
-
-Namespaces are arbitrary and their usage depends largely on the given usecase. They do not prescribe
-a specific way of constructing your iii application.
-
-The two primary points where Namespaces are used are during Worker registration via Compose and
-during Function and Trigger interactions. All have ways of declaring which namespace to use.
+Set the namespace in `worker-compose.yaml` or pass `--namespace` when starting Compose. Use the same
+namespace in Trigger and Function calls that target the project's workers. For the daemon namespace,
+project namespace, and routing model, see [Compose architecture](../understanding-iii/compose).
 
 ### Precedence
 
@@ -431,7 +648,7 @@ during Function and Trigger interactions. All have ways of declaring which names
 | `namespace:` in the file | The daemon namespace when `--namespace` is absent, and the project namespace. |
 | Neither                  | `default`.                                                                    |
 
-`namespace` is commonly defined in `worker-compose.yaml` but can be overriden on compose daemon
+`namespace` is commonly defined in `worker-compose.yaml` but can be overridden on compose daemon
 startup with the `--namespace` flag.
 
 Likewise, compose's own `compose::*` functions will exist within the same declared namespace.
@@ -495,13 +712,14 @@ containers:
 
 ### Top-level fields
 
-| Field             | Type   | Default | Description                                                                                   |
-| ----------------- | ------ | ------- | --------------------------------------------------------------------------------------------- |
-| `namespace`       | string | absent  | Namespace the project's workers register in. A project that declares none lands in `default`. |
-| `startup_timeout` | string | `60s`   | Readiness budget for every worker. A worker may override it.                                  |
-| `stop_timeout`    | string | `10s`   | Grace between the polite stop and the forced kill.                                            |
-| `engine`          | map    | absent  | Present when this Compose invocation owns and configures the engine.                          |
-| `containers`      | map    | empty   | Project workers. May be empty only when `engine:` is present.                                 |
+| Field              | Type    | Default | Description                                                                                         |
+| ------------------ | ------- | ------- | --------------------------------------------------------------------------------------------------- |
+| `namespace`        | string  | absent  | Namespace the project's workers register in. A project that declares none lands in `default`.       |
+| `startup_timeout`  | string  | `60s`   | Readiness budget for every worker. A worker may override it.                                        |
+| `stop_timeout`     | string  | `10s`   | Grace between the polite stop and the forced kill.                                                  |
+| `required_default` | boolean | `false` | Fallback for workers that omit `required`. An explicit worker value wins.                            |
+| `engine`           | map     | absent  | Present when this Compose invocation owns and configures the engine.                                |
+| `containers`       | map     | empty   | Project workers. May be empty only when `engine:` is present.                                       |
 
 ### Engine fields
 
@@ -513,14 +731,24 @@ containers:
 
 Allowed worker keys are `configuration`, `iii-worker-manager`, `iii-http-functions`, `iii-stream`,
 and `iii-sandbox`. Use `#instance` for another instance of an allowed type, for example
-`iii-worker-manager#rbac`. Internal `iii-engine-functions`, `iii-telemetry`, and `iii-observability`
-are injected and must not be declared.
+`iii-worker-manager#rbac`. The engine injects `iii-engine-functions`, `iii-telemetry` for anonymous
+usage analytics, and `iii-observability` for OpenTelemetry traces, metrics, and logs. Do not declare
+these workers.
 
 <Note>
-  These workers are always engine managed and started so this method of operating these workers is
-  an exception to the typical way for other workers. Changes to these workers requires an engine
-  restart.
+  Changes to these worker configurations take effect only after the engine restarts.
 </Note>
+
+#### Which engine Compose uses
+
+Compose takes the engine address from the first of these that supplies one: the `--engine` flag,
+the `III_URL` environment variable, the `engine:` section of the compose file, then
+`ws://127.0.0.1:49134`.
+
+An address from `--engine` or `III_URL` names an engine that already runs, so Compose connects to
+it and starts no engine of its own, even with `--up`. Only the compose file can give Compose an
+engine to own, and only `--up` takes it: an `engine:` section carries the engine's whole
+configuration, not only an address.
 
 ### Worker fields
 
@@ -537,6 +765,8 @@ Each key under `containers` is the name the worker registers under.
 | `environment`     | map            | empty                | Environment variables for this worker.                                                                     |
 | `env_file`        | array of paths | empty                | Read at start time, in declaration order. A later file wins on conflicting entries.                        |
 | `startup_timeout` | string         | the file's value     | Readiness budget for this worker.                                                                          |
+| `required`        | boolean        | `false`              | Whether a failed start fails the operation. `false` reports the failure and lets the operation carry on.   |
+| `restart`         | string         | `no`                 | What happens after a failed start or a run-time exit. `no`, `on-failure`, or `always`.                     |
 | `scripts`         | mapping        | absent               | See below.                                                                                                 |
 
 `path://` directories resolve against the compose file's directory. A missing directory fails with
@@ -653,24 +883,26 @@ config_override:
 ## Build registry packages
 
 ```text
-iii compose build [-f, --file <PATH>]
+iii compose build [-f, --file <PATH>] [--frozen]
 ```
 
 | Option              | Description                                                                              |
 | ------------------- | ---------------------------------------------------------------------------------------- |
 | `-f, --file <PATH>` | Compose file whose registry packages should be downloaded [default: worker-compose.yaml] |
+| `--frozen`          | Require an existing current lock and skip package selector resolution                     |
 
-`build` reads and validates the compose file, then downloads every `package://` worker into the same
-cache used by `compose::up`. The file defaults to `./worker-compose.yaml`. The command does not
-connect to an engine, start a worker, or run lifecycle hooks. Local `path://` workers and
-engine-managed workers need no registry download and are skipped.
+`build` reads and validates the compose file, prepares `worker-compose.lock`, then downloads every
+`package://` worker into the same cache used by `compose::up`. The file defaults to
+`./worker-compose.yaml`. The command does not connect to an engine, start a worker, or run lifecycle
+hooks. Local `path://` workers and engine-managed workers need no registry download and are skipped.
 
 ```bash
 iii compose build --file worker-compose.yaml
-iii compose --up --file worker-compose.yaml
+iii compose build --file worker-compose.yaml --frozen
+iii compose --up --file worker-compose.yaml --frozen
 ```
 
-The cache is shared under `~/.iii/compose/packages`, or under `III_COMPOSE_STATE_DIR` when that
+The cache is shared under `~/.iii/compose/packages`, or under `$III_COMPOSE_STATE_DIR/packages` when that
 variable is set. A later `compose::up` reuses a valid cached artifact if it exists.
 
 ## Readiness
@@ -687,10 +919,12 @@ Compose polls `engine::workers::list` every 200 ms until the worker's `startup_t
 | Its functions landed outside the project's namespace.          | `FUNCTIONS_IN_WRONG_NAMESPACE`     |
 | A worker already held that name in the namespace.              | `CONTAINER_NAME_TAKEN`             |
 
-After a worker is ready, the daemon checks it every 250 ms. A worker that exits takes its transitive
-dependents down with it and is recorded as `failed`. Automatic restarts are not performed. When the
-engine connection drops and comes back, every running worker gets its `startup_timeout` to register
-again.
+After a worker is ready, the daemon checks it every 250 ms. Its restart policy determines what
+happens after it exits. An eligible retry keeps its dependents running and reports `restarting`
+between attempts. A successful exit without an eligible retry is recorded as `stopped`. An
+unsuccessful exit without an eligible retry, or one that exhausts its retries, is recorded as
+`failed`. When no retry remains, its transitive dependents stop. When the engine connection drops
+and comes back, every running worker gets its `startup_timeout` to register again.
 
 Dependency shutdown is dependent upon when a shutdown happens:
 
@@ -701,24 +935,45 @@ Dependency shutdown is dependent upon when a shutdown happens:
 
 ## Where compose keeps state
 
-Compose state is stored under `~/.iii/compose`, or under `$III_COMPOSE_STATE_DIR` when that is set.
+Compose state is stored in `<project-dir>/.iii/compose/<namespace>/`. `<project-dir>` is the directory
+containing the canonical compose file, including when `--file` points outside the current working
+directory or follows a symbolic link. `<namespace>` is the daemon's namespace.
 
-| Path                        | Contents                                                                                                            |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `<ns>/<project>/state.json` | One project's child records. Owner-only.                                                                            |
-| `<ns>/<project>/config/`    | Resolved configuration files.                                                                                       |
-| `<ns>/<project>/logs/`      | Rotating stdout and stderr for every project worker.                                                                |
-| `<ns>/<project>/vm/`        | VM state for bundle and local-image workers, one directory each, plus the config each one publishes into its guest. |
-| `packages/`                 | Installed `package://` artefacts, shared by projects.                                                               |
+| Path                 | Contents                                                                                      |
+| -------------------- | --------------------------------------------------------------------------------------------- |
+| `engine.lock`        | Lock for the managed engine in this project and namespace.                                     |
+| `engine-config.yaml` | Generated engine configuration, removed after clean shutdown.                                  |
+| `engine.log`         | Rotating stdout and stderr for the managed engine.                                             |
+| `state.json`         | Child process records for the project. Owner-only.                                             |
+| `config/`            | Resolved worker configuration files.                                                          |
+| `logs/`              | Rotating stdout and stderr for project workers.                                                |
+| `vm/`                | VM state for bundle and local-image workers, including rootfs, boot scripts and guest configs. |
 
-`<ns>` is the daemon's namespace. `<project>` is derived from the compose file's canonical path + a
-short hash to prevent project name collisions.
+Two projects can use `default` with separate engines on different ports. Starting the same project
+and namespace twice is refused. Two daemons on the same engine must use different namespaces.
+With the default state layout, two compose files in the same directory must also use different
+namespaces.
+
+For a read-only project directory, set `III_COMPOSE_STATE_DIR` to a writable directory. Project state
+is then stored at `$III_COMPOSE_STATE_DIR/<project-slug>/<namespace>/`. The slug combines the project
+directory name with a hash of the canonical compose file path, keeping projects with the same
+directory name separate. With this override, two compose files in the same directory have separate
+state directories and can use the same namespace on separate engines.
+
+The package cache stays shared at `~/.iii/compose/packages`, or `$III_COMPOSE_STATE_DIR/packages`.
+Add `**/.iii/compose/` to the repository's `.gitignore` to exclude generated state, including state
+from nested projects, from version control.
 
 ```bash
 iii trigger compose::status --namespace dev file=./worker-compose.yaml
-# ... "state_dir": "/home/you/.iii/compose/dev/shop-3f2a1b9c"
-ls /home/you/.iii/compose/dev/shop-3f2a1b9c/logs/
+# ... "state_dir": "/home/you/shop/.iii/compose/dev"
+ls /home/you/shop/.iii/compose/dev/logs/
 ```
+
+Before upgrading from the shared namespace layout, stop existing Compose daemons with the old
+version and confirm that their engines and workers have stopped. The new version does not migrate
+old process records or logs. Previous state remains under `~/.iii/compose/<namespace>/` (or the old
+`III_COMPOSE_STATE_DIR` layout); keep any logs or VM data you need before removing it.
 
 ## Error codes
 
@@ -732,7 +987,7 @@ Compose can output the following error codes:
 | Packages            | `REGISTRY_UNREACHABLE`, `PACKAGE_NOT_RESOLVED`, `PACKAGE_NOT_INSTALLED`, `PACKAGE_DOWNLOAD_FAILED`, `PACKAGE_DIGEST_MISMATCH`, `PACKAGE_ARTIFACT_EMPTY`, `REGISTRY_NAME_REFUSED`, `UNSUPPORTED_PACKAGE_KIND`, `UNSUPPORTED_PLATFORM`, `BUNDLE_NEEDS_A_VM`                                                                                                       |
 | Start and readiness | `SPAWN_FAILED`, `HOOK_SPAWN_FAILED`, `HOOK_FAILED`, `HOOK_TIMEOUT`, `STARTUP_TIMEOUT`, `CHILD_EXITED_BEFORE_REGISTRATION`, `WORKER_IGNORED_NAMESPACE`, `WORKER_NAME_MISMATCH`, `FUNCTIONS_IN_WRONG_NAMESPACE`, `CONTAINER_NAME_TAKEN`, `CONFIG_FETCH_FAILED`, `CONFIG_PUBLISH_FAILED`, `ENGINE_CALL_FAILED`, `PROJECT_DID_NOT_START`                            |
 | Managed engine      | `ENGINE_SECTION_REQUIRES_MANAGED_START`, `ENGINE_ALREADY_OWNED`, `ENGINE_RESTART_REQUIRED`, `ENGINE_WORKER_IS_INJECTED`, `UNSUPPORTED_ENGINE_WORKER`, `INVALID_ENGINE_WORKER_CONFIG`, `INVALID_MANAGED_ENGINE_URL`, `MANAGED_ENGINE_ENDPOINT_MISMATCH`, `MANAGED_ENGINE_LISTENER_UNAVAILABLE`, `ENGINE_SPAWN_FAILED`, `ENGINE_STARTUP_TIMEOUT`, `ENGINE_EXITED` |
-| Daemon and project  | `NO_COMPOSE_FILE`, `WRONG_DAEMON`, `INVALID_NAMESPACE`, `UNKNOWN_CONTAINER`, `UNKNOWN_PROJECT`, `INVALID_STATE_FILE`, `STATE_DIR_UNAVAILABLE`, `DAEMON_ALREADY_SERVING`, `DAEMON_NAMESPACE_TAKEN`, `OPERATION_CANCELLED`, `OPERATION_ID_ALREADY_EXISTS`, `IO_ERROR`                                                                                             |
+| Daemon and project  | `NO_COMPOSE_FILE`, `WRONG_DAEMON`, `INVALID_NAMESPACE`, `UNKNOWN_CONTAINER`, `UNKNOWN_PROJECT`, `INVALID_STATE_FILE`, `STATE_DIR_UNAVAILABLE`, `DAEMON_ALREADY_SERVING`, `DAEMON_NAMESPACE_TAKEN`, `OPERATION_CANCELLED`, `OPERATION_ID_ALREADY_EXISTS`, `ADD_PLAN_STALE`, `STOP_TAKES_NO_CONTAINER`, `IO_ERROR`                                                                                                                                                   |
 | Command line        | `FILE_REQUIRES_UP`, `BUILD_CONFLICTS_WITH_SERVE_OPTIONS`                                                                                                                                                                                                                                                                                                        |
 
 ## Related
