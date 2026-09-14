@@ -504,6 +504,7 @@ impl Daemon {
         if shutdown.requested() {
             return Ok(None);
         }
+        crate::report::containers_starting();
         Ok(project
             .up_until_shutdown(container, operation_id, shutdown)
             .await)
@@ -1491,6 +1492,14 @@ impl MutationOutcome {
 
     pub(crate) fn is_failed(&self) -> bool {
         self.status == OpStatus::Failed
+    }
+
+    /// Requested containers that ended in error while the operation still
+    /// succeeded — only possible for a container whose effective `required`
+    /// is false. A terminal progress event must name these: "every requested
+    /// worker is ready" is false while one of them is not.
+    pub(crate) fn not_required_failures(&self) -> &[String] {
+        self.not_required_failures.as_deref().unwrap_or(&[])
     }
 }
 
