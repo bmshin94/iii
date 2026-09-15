@@ -66,6 +66,12 @@ pub struct ComposeCli {
     #[arg(long)]
     pub up: bool,
 
+    /// Require worker-compose.lock to match the compose file and use only its
+    /// exact package resolutions. Missing cache artifacts are downloaded from
+    /// the URLs in the lock.
+    #[arg(long, requires = "up")]
+    pub frozen: bool,
+
     /// The compose file. Only valid with `--up`. Defaults to
     /// `./worker-compose.yaml`, the same fallback `compose::up` uses when a
     /// call names no file.
@@ -104,6 +110,10 @@ pub struct BuildCli {
         default_value = DEFAULT_COMPOSE_FILE
     )]
     pub file: PathBuf,
+
+    /// Require an existing, current lock and do not resolve package selectors.
+    #[arg(long)]
+    pub frozen: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -156,7 +166,7 @@ fn parse_tail(value: &str) -> std::result::Result<usize, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposeCommand {
     /// Download registry packages without starting an engine or a worker.
-    Build { file: PathBuf },
+    Build { file: PathBuf, frozen: bool },
     /// Serve `compose::*` in the foreground.
     Serve {
         explicit_engine_url: Option<String>,
@@ -168,6 +178,8 @@ pub enum ComposeCommand {
         file: PathBuf,
         /// Whether to bring `file` up before the first call arrives.
         start: bool,
+        /// Whether initial startup must use an existing, current lock.
+        frozen: bool,
         /// Print worker output to the terminal while serving.
         follow: bool,
         /// With `follow`, only this process stream.
@@ -194,6 +206,7 @@ impl ComposeCli {
                     if self.engine.is_some()
                         || self.ns.is_some()
                         || self.up
+                        || self.frozen
                         || self.file.is_some()
                         || self.follow
                         || self.stream.is_some()
@@ -202,6 +215,7 @@ impl ComposeCli {
                     }
                     Ok(ComposeCommand::Build {
                         file: args.file.clone(),
+                        frozen: args.frozen,
                     })
                 }
                 ComposeSubcommand::Logs(logs) => Ok(ComposeCommand::Logs {
@@ -218,6 +232,9 @@ impl ComposeCli {
 
         if !self.up && self.file.is_some() {
             return Err(ComposeError::FileRequiresUp);
+        }
+        if !self.up && self.frozen {
+            return Err(ComposeError::FrozenRequiresUp);
         }
 
         let explicit_daemon_namespace = self.validated_namespace()?;
@@ -236,6 +253,7 @@ impl ComposeCli {
             explicit_daemon_namespace,
             file,
             start: self.up,
+            frozen: self.frozen,
             follow: self.follow,
             stream: self.stream,
         })
@@ -244,7 +262,7 @@ impl ComposeCli {
     /// `--namespace`, or `default` when no compose file is available.
     ///
     /// Validated here rather than at first use: it is both a namespace the
-    /// engine routes on and a directory under `~/.iii/compose`, so a separator
+    /// engine routes on and a project state directory, so a separator
     /// or an empty string is a daemon that half-works until the first write.
     pub fn daemon_namespace(&self) -> Result<String> {
         let explicit = self.validated_namespace()?;

@@ -24,12 +24,14 @@ pub mod config;
 pub mod configuration;
 pub mod daemon;
 pub mod dag;
+mod dependencies;
 pub mod edit;
 pub mod engine;
 pub mod error;
 pub mod hooks;
 pub mod interpolate;
 pub mod lifecycle;
+mod lockfile;
 pub mod logs;
 mod managed_engine;
 pub mod manifest;
@@ -42,12 +44,13 @@ pub mod project;
 pub mod registry;
 pub mod remote;
 pub mod report;
+mod restart;
 mod shutdown;
 pub mod spawn;
 pub mod state;
 
 pub use cli::{BuildCli, ComposeCli, ComposeCommand, ComposeLogsCli, ComposeSubcommand};
-pub use config::{ComposeFile, Container, EngineSpec, WorkerSource};
+pub use config::{ComposeFile, Container, EngineSpec, RestartConfig, RestartPolicy, WorkerSource};
 pub use error::{ComposeError, Result};
 pub use manifest::{StartSpec, ValidationReport, VmSpec};
 
@@ -59,11 +62,19 @@ pub enum EngineMode {
 
 /// Resolves the engine URL and ownership after the compose file is parsed.
 ///
-/// An explicit CLI URL always selects an external engine. Without one, an
-/// `engine:` section is managed only when `--up` starts that file; a bare
-/// daemon connects to its URL without taking ownership. File configuration
-/// wins over the process environment, and the local engine address is the
-/// final fallback.
+/// The order is `--engine`, then `III_URL`, then the compose file, then the
+/// local engine address. The environment beats the file: an exported variable
+/// is the caller's live intent, while the file is only what the working
+/// directory happens to hold. `iii trigger` resolves its endpoint the same
+/// way.
+///
+/// `III_URL` selects an engine exactly as `--engine` does, ownership included:
+/// an address that comes from outside the file names an engine that is already
+/// running, so compose connects to it and starts none of its own. Only the
+/// file can hand compose an engine to own, and only `--up` takes it: an
+/// `engine:` section carries the engine's whole configuration, not just an
+/// address, so a bare URL is not a thing compose could spawn from. A bare
+/// daemon connects to the file's engine without taking ownership.
 pub fn resolve_engine_mode(
     file: Option<&ComposeFile>,
     start: bool,
@@ -76,16 +87,25 @@ pub fn resolve_engine_mode(
         };
     }
 
-    if start && let Some(engine) = file.and_then(|file| file.engine.as_ref()) {
+    if let Some(url) = environment_engine_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        return EngineMode::External {
+            url: url.to_string(),
+        };
+    }
+
+    let file_engine = file.and_then(|file| file.engine.as_ref());
+
+    if start && let Some(engine) = file_engine {
         return EngineMode::Managed {
             url: engine.url.clone(),
         };
     }
 
-    let url = file
-        .and_then(|file| file.engine.as_ref())
+    let url = file_engine
         .map(|engine| engine.url.as_str())
-        .or(environment_engine_url)
         .unwrap_or(config::DEFAULT_ENGINE_URL);
     EngineMode::External {
         url: url.to_string(),
@@ -113,7 +133,11 @@ pub async fn run(cli: ComposeCli) -> i32 {
     };
 
     match command {
-        ComposeCommand::Build { file } => match build::build(&file).await {
+        ComposeCommand::Build { file, frozen } => match if frozen {
+            build::build_frozen(&file).await
+        } else {
+            build::build(&file).await
+        } {
             Ok(_) => 0,
             Err(err) => report_error(&err),
         },
@@ -122,6 +146,7 @@ pub async fn run(cli: ComposeCli) -> i32 {
             explicit_daemon_namespace,
             file,
             start,
+            frozen,
             follow,
             stream,
         } => match serve(
@@ -129,6 +154,7 @@ pub async fn run(cli: ComposeCli) -> i32 {
             explicit_daemon_namespace,
             file,
             start,
+            frozen,
             follow.then_some(FollowOutput { stream }),
         )
         .await
@@ -363,6 +389,7 @@ async fn serve(
     explicit_daemon_namespace: Option<String>,
     file: std::path::PathBuf,
     start: bool,
+    frozen: bool,
     follow: Option<FollowOutput>,
 ) -> Result<()> {
     use colored::Colorize;
@@ -371,6 +398,12 @@ async fn serve(
     // project, but an existing default file still supplies its URL and
     // namespace.
     let initial_file = load_invocation_file(&file, start)?;
+    if start
+        && frozen
+        && let Some(initial_file) = &initial_file
+    {
+        lockfile::preflight_frozen(initial_file)?;
+    }
     let daemon_namespace =
         resolve_daemon_namespace(explicit_daemon_namespace.clone(), initial_file.as_ref());
     let environment_engine_url = std::env::var("III_URL")
@@ -397,10 +430,13 @@ async fn serve(
             policy
         }
         EngineMode::External { .. } => {
+            // An address from outside the file overrides the file's engine, so
+            // the file's declared engine is no longer what this daemon must
+            // match. `III_URL` counts here for the same reason `--engine`
+            // does: it named the engine that won.
+            let overridden = explicit_engine_url.is_some() || environment_engine_url.is_some();
             match initial_file.as_ref().filter(|file| file.engine.is_some()) {
-                Some(file) if explicit_engine_url.is_some() => {
-                    daemon::EnginePolicy::external_overriding(file)
-                }
+                Some(file) if overridden => daemon::EnginePolicy::external_overriding(file),
                 Some(file) => daemon::EnginePolicy::external_from_file(file),
                 None => daemon::EnginePolicy::External,
             }
@@ -414,6 +450,7 @@ async fn serve(
 
     let mut start_project = start.then(|| InitialProject {
         file,
+        frozen,
         progress: report::StartupProgress::start(matches!(engine_mode, EngineMode::Managed { .. })),
     });
     let managed_engine = match engine_mode {
@@ -424,7 +461,8 @@ async fn serve(
             let Some(spec) = owner.engine.as_ref() else {
                 unreachable!("managed mode is selected only from an engine section");
             };
-            let engine = managed_engine::ManagedEngine::start(spec, &daemon_namespace).await?;
+            let engine =
+                managed_engine::ManagedEngine::start(spec, &daemon_namespace, &owner.path).await?;
             if let Some(project) = &start_project {
                 project.progress.engine_waiting();
             }
@@ -521,6 +559,7 @@ fn load_invocation_file(file: &std::path::Path, required: bool) -> Result<Option
 
 struct InitialProject {
     file: std::path::PathBuf,
+    frozen: bool,
     progress: report::StartupProgress,
 }
 
@@ -640,12 +679,18 @@ async fn serve_daemon(
     if let (Some(project), Some(operation)) = (&mut start, startup_operation) {
         let file = &project.file;
         report::line("");
-        project.progress.containers_starting();
+        project.progress.downloads_starting();
         let operation_id = operation.id().to_string();
         let startup_shutdown = shutdown.clone().or(shutdown::ShutdownSignal::from_receiver(
             operation.cancellation(),
         ));
-        let up = daemon.up_until_shutdown(Some(file), None, operation_id, startup_shutdown);
+        let up = daemon.up_until_shutdown(
+            Some(file),
+            None,
+            operation_id,
+            startup_shutdown,
+            project.frozen,
+        );
         tokio::pin!(up);
         let mut connected = daemon.engine().is_connected();
         if connected {
@@ -881,7 +926,7 @@ fn report_error(err: &ComposeError) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComposeFile, load_invocation_file, resolve_daemon_namespace};
+    use super::{ComposeFile, load_invocation_file, resolve_daemon_namespace, serve};
 
     fn compose_with_namespace() -> ComposeFile {
         ComposeFile::parse(
@@ -954,5 +999,26 @@ mod tests {
         let loaded = load_invocation_file(&path, false).unwrap();
 
         assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn frozen_start_checks_the_lock_before_starting_a_managed_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker-compose.yaml");
+        let namespace = format!("frozen-preflight-{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            &path,
+            format!(
+                "namespace: {namespace}\nengine: {{ workers: {{}} }}\ncontainers:\n  state:\n    worker: package://state\n    version: next\n"
+            ),
+        )
+        .unwrap();
+        let compose_path = path.canonicalize().unwrap();
+        let state = crate::state::StateStore::for_project(&namespace, &compose_path).unwrap();
+
+        let error = serve(None, None, path, true, true, None).await.unwrap_err();
+
+        assert_eq!(error.code(), "COMPOSE_LOCK_REQUIRED");
+        assert!(!state.dir().exists());
     }
 }

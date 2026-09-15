@@ -54,6 +54,9 @@ pub struct ComposeRequest {
     pub file: Option<String>,
     /// Restrict the operation to one container and what it needs.
     pub container: Option<String>,
+    /// Require a matching existing lock and skip package selector resolution.
+    /// Used by `compose::up`.
+    pub frozen: Option<bool>,
     /// The worker a call is about.
     ///
     /// `compose::update` reads a spec: `name` or `name@version`. Omit both
@@ -106,6 +109,22 @@ struct LifecycleOptions {
     file: Option<String>,
     /// Restrict the lifecycle operation to one container.
     container: Option<String>,
+}
+
+/// Request fields used by `compose::up`.
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+struct UpOptions {
+    /// Optional daemon guard. Use the trigger `--namespace` flag to route.
+    namespace: Option<String>,
+    /// Compose file on the daemon host. Defaults to `worker-compose.yaml` in
+    /// the daemon working directory.
+    file: Option<String>,
+    /// Restrict startup to one container and its dependencies.
+    container: Option<String>,
+    /// Require the compose file and existing lock to match. Package selectors
+    /// are not resolved, but missing cached artifacts are downloaded from the lock.
+    frozen: Option<bool>,
 }
 
 /// Request fields used by project read operations.
@@ -325,6 +344,17 @@ impl Operation {
     }
 }
 
+/// The container a `compose::stop` request names, if any. Both fields are
+/// checked in turn: a blank `container` must not hide a `worker`, or
+/// `{"container": " ", "worker": "api"}` would stop the whole daemon.
+fn stop_target(request: &ComposeRequest) -> Option<&str> {
+    [request.container.as_deref(), request.worker.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+}
+
 /// Canonical list of functions exposed by the compose daemon.
 const REGISTERED_OPERATIONS: &[(&str, Operation)] = &[
     ("up", Operation::Up),
@@ -369,14 +399,23 @@ async fn dispatch(
     let file = request.file.as_ref().map(std::path::PathBuf::from);
 
     match operation {
-        Operation::Up => match daemon
-            .up(
-                file.as_deref(),
-                request.container.as_deref(),
-                operation_id(),
-            )
-            .await
-        {
+        Operation::Up => match if request.frozen.unwrap_or(false) {
+            daemon
+                .up_frozen(
+                    file.as_deref(),
+                    request.container.as_deref(),
+                    operation_id(),
+                )
+                .await
+        } else {
+            daemon
+                .up(
+                    file.as_deref(),
+                    request.container.as_deref(),
+                    operation_id(),
+                )
+                .await
+        } {
             Ok(result) => Ok(to_value(&MutationOutcome::from_operations(
                 result.status,
                 result.changed,
@@ -417,12 +456,7 @@ async fn dispatch(
                     .add_configured(file.as_deref(), &workers, task_operation_id)
                     .await
             };
-            spawn_mutation(
-                operation,
-                mutation,
-                "all requested workers are ready",
-                "one or more workers failed",
-            );
+            spawn_mutation(operation, mutation, ADD_DETAILS);
             Ok(to_value(&accepted))
         }
         Operation::Remove => {
@@ -454,12 +488,7 @@ async fn dispatch(
                     .remove(file.as_deref(), &workers, task_operation_id)
                     .await
             };
-            spawn_mutation(
-                operation,
-                mutation,
-                "all requested workers were removed",
-                "one or more workers could not be removed",
-            );
+            spawn_mutation(operation, mutation, REMOVE_DETAILS);
             Ok(to_value(&accepted))
         }
         Operation::Restart => match daemon
@@ -513,12 +542,7 @@ async fn dispatch(
                     .update(file.as_deref(), &workers, task_operation_id)
                     .await
             };
-            spawn_mutation(
-                operation,
-                mutation,
-                "all requested workers were updated",
-                "one or more workers could not be updated",
-            );
+            spawn_mutation(operation, mutation, UPDATE_DETAILS);
             Ok(to_value(&accepted))
         }
         Operation::Down => match daemon
@@ -579,8 +603,14 @@ async fn dispatch(
             Err(err) => Err(compose_error(&err)),
         },
         // Answers first, exits after: the serve loop picks the request up and
-        // runs the same teardown a signal would.
-        Operation::Stop => Ok(daemon.request_stop().await),
+        // runs the same teardown a signal would. Stop takes the whole daemon
+        // down, so a request that names a container is refused, not ignored.
+        Operation::Stop => match stop_target(&request) {
+            Some(container) => Err(compose_error(&ComposeError::StopTakesNoContainer {
+                container: container.to_string(),
+            })),
+            None => Ok(daemon.request_stop().await),
+        },
         // Validation is a question about a file, so it holds nothing: naming a
         // file here must not leave the daemon owning a project, and must not
         // write the durable state that would bind that id to it.
@@ -642,11 +672,65 @@ async fn admit_mutation(
     Ok((operation, accepted))
 }
 
+/// Compose the terminal detail for a mutation that succeeded.
+///
+/// A non-required container that never reached its target state leaves the
+/// operation succeeding, which is by design — but the blanket success line
+/// then claims every worker is up while one is not, and a caller polling
+/// `compose::operation` has no other place to learn it. Name those containers
+/// instead (MOT-4761).
+///
+/// The list is the project's, not this operation's request: reconciliation
+/// reports every container it touched, so one left broken by an earlier
+/// operation keeps being named until it starts. That is the point — the
+/// alternative is a success line that is false about the project.
+fn succeeded_detail(details: MutationDetails, not_required_failures: &[String]) -> String {
+    if not_required_failures.is_empty() {
+        return details.success.to_string();
+    }
+    format!(
+        "{}: {}. The operation still succeeded because they are not required; \
+         check compose::status and their logs before using them.",
+        details.partial,
+        not_required_failures.join(", ")
+    )
+}
+
+/// The three terminal lines one mutation can finish with. Named fields rather
+/// than three positional `&str`s: they are the same type, so a swap at a call
+/// site would compile and only show up as a wrong sentence in a live run.
+#[derive(Clone, Copy)]
+struct MutationDetails {
+    /// Every container reached its target state.
+    success: &'static str,
+    /// The operation succeeded, but some non-required container did not.
+    partial: &'static str,
+    /// A required container did not, so the operation failed.
+    failed: &'static str,
+}
+
+const ADD_DETAILS: MutationDetails = MutationDetails {
+    success: "all requested workers are ready",
+    partial: "workers that did not start",
+    failed: "one or more workers failed",
+};
+
+const REMOVE_DETAILS: MutationDetails = MutationDetails {
+    success: "all requested workers were removed",
+    partial: "workers that could not be removed",
+    failed: "one or more workers could not be removed",
+};
+
+const UPDATE_DETAILS: MutationDetails = MutationDetails {
+    success: "all requested workers were updated",
+    partial: "workers that could not be updated",
+    failed: "one or more workers could not be updated",
+};
+
 fn spawn_mutation<F>(
     operation: Arc<crate::operation::Operation>,
     mutation: F,
-    success_detail: &'static str,
-    failed_detail: &'static str,
+    details: MutationDetails,
 ) where
     F: Future<Output = Result<MutationOutcome, ComposeError>> + Send + 'static,
 {
@@ -672,9 +756,9 @@ fn spawn_mutation<F>(
                             crate::operation::OperationStatus::Succeeded
                         },
                         if failed {
-                            failed_detail
+                            details.failed.to_string()
                         } else {
-                            success_detail
+                            succeeded_detail(details, outcome.not_required_failures())
                         },
                     )
                     .await;
@@ -787,7 +871,11 @@ fn op_description(function_id: &str) -> &'static str {
     match function_id {
         "compose::up" => {
             "Start a compose project, or one container and its dependencies. \
-             Repeated calls leave ready containers running."
+             Repeated calls leave ready containers running. A container whose \
+             effective required value is false is named in \
+             not_required_failures when it fails, and the operation still \
+             returns ok. Frozen mode requires worker-compose.lock to match and \
+             skips package resolution."
         }
         "compose::down" => {
             "Stop a compose project, or one container and its dependents, in \
@@ -796,7 +884,9 @@ fn op_description(function_id: &str) -> &'static str {
         "compose::list" => "List every project loaded by this compose daemon.",
         "compose::status" => {
             "Report the project namespace, state directory, daemon pid, and \
-             current state of every declared container."
+             current state of every declared container. A container declaring \
+             a 'restart' policy reports as 'restarting' while it waits for the \
+             supervisor's next attempt."
         }
         "compose::logs" => {
             "Read bounded worker stdout and stderr. A cursor continues from the last response; \
@@ -812,8 +902,8 @@ fn op_description(function_id: &str) -> &'static str {
         }
         "compose::add" => {
             "Accept an observable operation that declares one or more workers and their registry \
-             dependencies in the compose file, pins resolved versions, then reconciles changed \
-             workers once."
+             dependencies in the compose file, locks resolved packages, then reconciles changed \
+             workers once. Explicit selectors remain in the compose file."
         }
         "compose::remove" => {
             "Accept an observable operation that removes one or more declared workers and \
@@ -825,9 +915,10 @@ fn op_description(function_id: &str) -> &'static str {
              changing its dependency graph."
         }
         "compose::update" => {
-            "Accept an observable operation that moves one or more declared package workers to \
-             requested or latest versions, then restarts the project once if versions change. \
-             Omit worker and workers to update all declared package workers; path workers are skipped."
+            "Accept an observable operation that refreshes declared package selectors or moves \
+             workers to requested versions, including their dependency graphs. Omit worker and \
+             workers to move all declared packages to latest; path workers are skipped. The \
+             project restarts only when runtime content or topology changes."
         }
         "compose::schema" => {
             "Return request and response JSON Schemas for compose::* functions. \
@@ -875,7 +966,7 @@ fn schema_table() -> &'static [SchemaTriple] {
         vec![
             (
                 "compose::up",
-                schema_for_value::<LifecycleOptions>(),
+                schema_for_value::<UpOptions>(),
                 schema_for_value::<MutationOutcome>(),
             ),
             (
@@ -1089,6 +1180,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stop_target_checks_both_fields_and_ignores_blanks() {
+        let bare = ComposeRequest::default();
+        assert_eq!(stop_target(&bare), None);
+
+        let blank = ComposeRequest {
+            container: Some("   ".to_string()),
+            worker: Some("".to_string()),
+            ..ComposeRequest::default()
+        };
+        assert_eq!(stop_target(&blank), None, "blanks are no target");
+
+        let hidden = ComposeRequest {
+            container: Some(" ".to_string()),
+            worker: Some("api".to_string()),
+            ..ComposeRequest::default()
+        };
+        assert_eq!(
+            stop_target(&hidden),
+            Some("api"),
+            "a blank container must not hide the worker"
+        );
+
+        let container = ComposeRequest {
+            container: Some(" harness ".to_string()),
+            ..ComposeRequest::default()
+        };
+        assert_eq!(stop_target(&container), Some("harness"));
+    }
+
     fn schema_entry(id: &str) -> &'static SchemaTriple {
         schema_table()
             .iter()
@@ -1237,6 +1358,7 @@ mod tests {
         assert!(up.contains_key("namespace"));
         assert!(up.contains_key("file"));
         assert!(up.contains_key("container"));
+        assert!(up.contains_key("frozen"));
         assert!(!up.contains_key("worker"));
 
         for function_id in ["compose::add", "compose::update", "compose::remove"] {
@@ -1362,6 +1484,59 @@ mod tests {
                 !properties.contains_key("containers"),
                 "{function_id} exposes container internals"
             );
+        }
+    }
+
+    #[test]
+    fn a_succeeding_mutation_names_the_workers_that_did_not_start() {
+        for details in [
+            super::ADD_DETAILS,
+            super::REMOVE_DETAILS,
+            super::UPDATE_DETAILS,
+        ] {
+            assert_eq!(
+                super::succeeded_detail(details, &[]),
+                details.success,
+                "nothing failed, so the blanket line is true"
+            );
+            let partial = super::succeeded_detail(
+                details,
+                &["bulk-importer".to_string(), "analytics".to_string()],
+            );
+            assert!(
+                partial.starts_with(&format!("{}: bulk-importer, analytics.", details.partial)),
+                "the terminal detail names them: {partial}"
+            );
+            assert!(
+                !partial.contains(details.success),
+                "and never claims they are ready: {partial}"
+            );
+            assert!(
+                partial.contains("compose::status"),
+                "pointing at where to look: {partial}"
+            );
+        }
+    }
+
+    /// The three lines are the same type, so the compiler cannot catch a swap
+    /// at a call site; distinctness is what makes a swap visible in a test.
+    #[test]
+    fn every_mutation_names_its_own_three_outcomes() {
+        let all = [
+            super::ADD_DETAILS,
+            super::REMOVE_DETAILS,
+            super::UPDATE_DETAILS,
+        ];
+        let mut lines: Vec<&str> = all
+            .iter()
+            .flat_map(|d| [d.success, d.partial, d.failed])
+            .collect();
+        let total = lines.len();
+        lines.sort_unstable();
+        lines.dedup();
+        assert_eq!(lines.len(), total, "two mutations share a terminal line");
+        for d in all {
+            assert!(!d.partial.contains("ready") && !d.partial.contains("were "));
         }
     }
 }

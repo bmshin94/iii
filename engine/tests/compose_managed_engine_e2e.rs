@@ -143,12 +143,14 @@ fn compose_up_starts_logs_and_stops_the_engine_it_owns() {
     let progress = String::from_utf8_lossy(&output.stderr);
     let waiting = progress.find("Engine Waiting for connection").unwrap();
     let ready = progress.find("Engine Ready").unwrap();
-    let containers = progress.find("Containers Starting").unwrap();
-    let failed = progress.find("Containers Failed").unwrap();
+    let downloads = progress.find("Downloads Checking").unwrap();
+    let failed = progress.find("Downloads Failed").unwrap();
     assert!(
-        waiting < ready && ready < containers && containers < failed,
+        waiting < ready && ready < downloads && downloads < failed,
         "{progress}"
     );
+    assert!(progress.contains("Containers Not started"), "{progress}");
+    assert!(!progress.contains("Containers Starting"), "{progress}");
     assert!(!progress.contains("Containers Ready"), "{progress}");
     assert!(
         !progress.contains('\x1b'),
@@ -159,7 +161,13 @@ fn compose_up_starts_logs_and_stops_the_engine_it_owns() {
         "owner file not announced:\n{terminal}"
     );
 
-    let generated_config = state.path().join("managed-e2e/engine-config.yaml");
+    let project_state = state
+        .path()
+        .join(iii_compose::state::project_slug(
+            &compose.canonicalize().unwrap(),
+        ))
+        .join("managed-e2e");
+    let generated_config = project_state.join("engine-config.yaml");
     assert!(
         terminal.contains(generated_config.to_str().unwrap()),
         "generated config not announced:\n{terminal}"
@@ -169,7 +177,7 @@ fn compose_up_starts_logs_and_stops_the_engine_it_owns() {
         "clean error teardown must remove generated config"
     );
 
-    let engine_log = state.path().join("managed-e2e/engine.log");
+    let engine_log = project_state.join("engine.log");
     assert!(
         engine_log.exists(),
         "no engine log at {}",
@@ -394,7 +402,16 @@ fn signal_during_managed_engine_startup_stops_the_engine() {
     )
     .unwrap();
 
-    let generated_config = state.path().join("managed-early-signal/engine-config.yaml");
+    let generated_config = state
+        .path()
+        .join(iii_compose::state::project_slug(
+            &project
+                .path()
+                .join("worker-compose.yaml")
+                .canonicalize()
+                .unwrap(),
+        ))
+        .join("managed-early-signal/engine-config.yaml");
     let mut child = iii_bin()
         .current_dir(project.path())
         .env("III_COMPOSE_STATE_DIR", state.path())
@@ -468,6 +485,13 @@ fn signal_during_dependent_startup_rolls_back_every_started_process() {
 
     let generated_config = state
         .path()
+        .join(iii_compose::state::project_slug(
+            &project
+                .path()
+                .join("worker-compose.yaml")
+                .canonicalize()
+                .unwrap(),
+        ))
         .join("managed-dependent-signal/engine-config.yaml");
     let mut child = iii_bin()
         .current_dir(project.path())
