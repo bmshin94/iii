@@ -777,11 +777,14 @@ async fn follow_project_output(
     daemon: std::sync::Arc<daemon::Daemon>,
     stream: Option<logs::LogStream>,
 ) {
+    use colored::Colorize;
     use std::collections::BTreeMap;
 
     const POLL_WAIT_MS: u64 = 1_000;
     let mut cursors: BTreeMap<std::path::PathBuf, BTreeMap<String, logs::LogCursor>> =
         BTreeMap::new();
+    let mut failed: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
     loop {
         let projects = daemon.loaded().await;
         if projects.is_empty() {
@@ -789,21 +792,41 @@ async fn follow_project_output(
             continue;
         }
         for project in projects {
-            let entry = cursors
-                .entry(project.file_path().to_path_buf())
-                .or_default();
-            // First read of a project shows what its workers printed while
-            // starting; after that only new lines.
-            let tail = if entry.is_empty() {
-                logs::DEFAULT_TAIL_LINES
-            } else {
-                0
-            };
-            if let Ok(outcome) = project
-                .logs(None, entry.clone(), tail, stream, POLL_WAIT_MS)
-                .await
-            {
-                print_followed_output(outcome, entry);
+            let path = project.file_path().to_path_buf();
+            let entry = cursors.entry(path.clone()).or_default();
+            // `tail` is a per-container limit, applied to whichever of the two
+            // reads a container needs: the last N retained lines for one this
+            // follower has no cursor for, at most N new lines for one it does.
+            // A container starting after the first poll therefore still shows
+            // what it printed while starting, and passing 0 here would have
+            // read nothing at all, for anyone, after the first poll.
+            //
+            // ponytail: 100 lines per container per second; raise the limit if
+            // a chatty worker is seen falling behind.
+            let outcome = project
+                .logs(
+                    None,
+                    entry.clone(),
+                    logs::DEFAULT_TAIL_LINES,
+                    stream,
+                    POLL_WAIT_MS,
+                )
+                .await;
+            match outcome {
+                Ok(outcome) => print_followed_output(outcome, entry),
+                Err(error) => {
+                    // `Project::logs` reports a filesystem failure before its
+                    // own wait, so retrying straight away is a hot loop on an
+                    // unreadable log directory. Said once per project, because
+                    // the condition lasts.
+                    if failed.insert(path) {
+                        report::line(&format!(
+                            "{}",
+                            format!("cannot follow this project's output: {error}").dimmed()
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(POLL_WAIT_MS)).await;
+                }
             }
         }
     }
