@@ -494,6 +494,7 @@ mod tests {
 
         let vm = StartSpec::Vm(crate::manifest::VmSpec::Bundle {
             install_dir: PathBuf::from("/tmp/bundle"),
+            package_name: "bundle".to_string(),
         });
         assert_eq!(
             spawn_plan(&ctx(&vm, None, &user_env)).env["III_ISOLATION"],

@@ -980,54 +980,7 @@ async fn start_one_until_shutdown(
                 key,
                 &format!("starting {} {}", installed.name, installed.version),
             );
-            match installed.payload {
-                crate::registry::Payload::Binary(program) => {
-                    if container.runtime.is_some() {
-                        return Err(ComposeError::RuntimeRequiresBundle {
-                            container: key.to_string(),
-                            kind: "binary".to_string(),
-                        }
-                        .into());
-                    }
-                    (
-                        StartSpec::Exec {
-                            program,
-                            args: Vec::new(),
-                        },
-                        installed.default_config,
-                    )
-                }
-                crate::registry::Payload::Bundle(install_dir) => {
-                    match container.runtime.unwrap_or(BundleRuntime::Vm) {
-                        BundleRuntime::Vm => (
-                            StartSpec::Vm(VmSpec::Bundle { install_dir }),
-                            installed.default_config,
-                        ),
-                        BundleRuntime::Host => {
-                            let manifest = read_host_bundle_manifest(&install_dir, key)?;
-                            let manifest_start = manifest
-                                .start
-                                .expect("host bundle validation requires scripts.start");
-                            let run = container
-                                .scripts
-                                .run
-                                .clone()
-                                .unwrap_or_else(|| manifest_start.clone());
-                            (
-                                StartSpec::HostBundle(HostBundleSpec {
-                                    install_dir,
-                                    install: manifest.install,
-                                    run,
-                                    env: manifest.env,
-                                    has_base_image: manifest.base_image.is_some(),
-                                    has_resources: manifest.has_resources,
-                                }),
-                                installed.default_config,
-                            )
-                        }
-                    }
-                }
-            }
+            installed_start(key, container, installed)?
         }
         crate::config::WorkerSource::Path { .. } => (resolve_start(key, container)?, None),
     };
@@ -1203,6 +1156,55 @@ async fn start_one_until_shutdown(
     Ok((record, child))
 }
 
+/// Resolves the installed artifact without conflating its package and instance names.
+fn installed_start(
+    key: &str,
+    container: &Container,
+    installed: crate::registry::InstalledPackage,
+) -> Result<(StartSpec, Option<serde_yaml::Value>)> {
+    let start = match installed.payload {
+        crate::registry::Payload::Binary(program) => {
+            if container.runtime.is_some() {
+                return Err(ComposeError::RuntimeRequiresBundle {
+                    container: key.to_string(),
+                    kind: "binary".to_string(),
+                });
+            }
+            StartSpec::Exec {
+                program,
+                args: Vec::new(),
+            }
+        }
+        crate::registry::Payload::Bundle(install_dir) => {
+            // Registry aliases retain the requested name in `name`; `alias_of`
+            // is the canonical identity also used by the verified package cache.
+            let package_name = installed.alias_of.unwrap_or(installed.name);
+            match container.runtime.unwrap_or(BundleRuntime::Vm) {
+                BundleRuntime::Vm => StartSpec::Vm(VmSpec::Bundle {
+                    install_dir,
+                    package_name,
+                }),
+                BundleRuntime::Host => {
+                    let manifest = read_host_bundle_manifest(&install_dir, &package_name)?;
+                    let manifest_start = manifest
+                        .start
+                        .expect("host bundle validation requires scripts.start");
+                    let run = container.scripts.run.clone().unwrap_or(manifest_start);
+                    StartSpec::HostBundle(HostBundleSpec {
+                        install_dir,
+                        install: manifest.install,
+                        run,
+                        env: manifest.env,
+                        has_base_image: manifest.base_image.is_some(),
+                        has_resources: manifest.has_resources,
+                    })
+                }
+            }
+        }
+    };
+    Ok((start, installed.default_config))
+}
+
 fn report_host_bundle_warnings(key: &str, container: &Container, spec: &HostBundleSpec) {
     report::line(&format!(
         "warning: {key} is a registry bundle running on the host without VM isolation"
@@ -1250,15 +1252,49 @@ async fn vm_command(
     plan: &crate::spawn::SpawnPlan,
     config: Option<&ResolvedConfig>,
 ) -> std::result::Result<tokio::process::Command, String> {
-    let (worker_dir, run_override, prepare_command) = match start {
-        StartSpec::Vm(VmSpec::Bundle { install_dir }) => (install_dir, None, "__bundle-prepare"),
+    let (prepare_command, request) =
+        vm_prepare_request(key, start, plan, ctx.engine_url, ctx.vm_dir, config)?;
+    let plan = prepare_vm(prepare_command, &request).await?;
+    validate_vm_package(&request, &plan)?;
+    let mut command = tokio::process::Command::new(&plan.program);
+    command.args(&plan.args);
+    for (name, value) in &plan.env {
+        command.env(name, value);
+    }
+    // Not inherited: a lifeline from whoever started compose would tie the VM
+    // to the wrong process.
+    for name in &plan.env_remove {
+        command.env_remove(name);
+    }
+    command.stdin(std::process::Stdio::null());
+    Ok(command)
+}
+
+/// The preparation contract keeps package validation separate from guest identity.
+fn vm_prepare_request(
+    key: &str,
+    start: &StartSpec,
+    plan: &crate::spawn::SpawnPlan,
+    engine_url: &str,
+    vm_dir: &std::path::Path,
+    config: Option<&ResolvedConfig>,
+) -> std::result::Result<(&'static str, serde_json::Value), String> {
+    let (worker_dir, package_name, run_override, prepare_command) = match start {
+        StartSpec::Vm(VmSpec::Bundle {
+            install_dir,
+            package_name,
+        }) => (
+            install_dir,
+            Some(package_name.as_str()),
+            None,
+            "__bundle-prepare",
+        ),
         StartSpec::Vm(VmSpec::Local {
             worker_dir,
             run_override,
-        }) => (worker_dir, run_override.as_deref(), "__local-prepare"),
+        }) => (worker_dir, None, run_override.as_deref(), "__local-prepare"),
         _ => return Err("not a VM container".to_string()),
     };
-
     let mut env: BTreeMap<String, String> = plan.env.clone();
     let config_dir = match config {
         Some(config) => {
@@ -1272,7 +1308,7 @@ async fn vm_command(
             let Some(name) = path.file_name() else {
                 return Err(format!("config file has no name: {}", path.display()));
             };
-            let dir = ctx.vm_dir.join(format!("{key}-config"));
+            let dir = vm_dir.join(format!("{key}-config"));
             std::fs::create_dir_all(&dir)
                 .map_err(|err| format!("cannot make {}: {err}", dir.display()))?;
             let published = dir.join(name);
@@ -1293,29 +1329,37 @@ async fn vm_command(
         None => None,
     };
 
-    let request = serde_json::json!({
+    let mut request = serde_json::json!({
         "worker_name": key,
         "worker_dir": worker_dir,
-        "state_dir": ctx.vm_dir.join(key),
-        "engine_url": ctx.engine_url,
+        "state_dir": vm_dir.join(key),
+        "engine_url": engine_url,
         "extra_env": env,
         "config_dir": config_dir,
         "run_override": run_override,
     });
 
-    let plan = prepare_vm(prepare_command, &request).await?;
-    let mut command = tokio::process::Command::new(&plan.program);
-    command.args(&plan.args);
-    for (name, value) in &plan.env {
-        command.env(name, value);
+    if let Some(package_name) = package_name {
+        request["package_name"] = package_name.into();
     }
-    // Not inherited: a lifeline from whoever started compose would tie the VM
-    // to the wrong process.
-    for name in &plan.env_remove {
-        command.env_remove(name);
+    Ok((prepare_command, request))
+}
+
+fn validate_vm_package(
+    request: &serde_json::Value,
+    plan: &VmPlan,
+) -> std::result::Result<(), String> {
+    if let Some(expected) = request
+        .get("package_name")
+        .and_then(serde_json::Value::as_str)
+        && plan.package_name.as_deref() != Some(expected)
+    {
+        return Err(format!(
+            "iii-worker did not confirm validation of bundle package {expected:?}; \
+             install iii-worker from the same release as iii"
+        ));
     }
-    command.stdin(std::process::Stdio::null());
-    Ok(command)
+    Ok(())
 }
 
 /// Where a container's config directory appears inside the guest. The same
@@ -1326,6 +1370,10 @@ const GUEST_CONFIG_DIR: &str = "/run/iii/config";
 /// the environment to start it with.
 #[derive(serde::Deserialize)]
 struct VmPlan {
+    /// Acknowledges the package-name contract; older helpers must not silently
+    /// validate against the instance name and return an executable plan.
+    #[serde(default)]
+    package_name: Option<String>,
     program: std::path::PathBuf,
     args: Vec<String>,
     #[serde(default)]
@@ -1627,6 +1675,209 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bundle_fixture(
+        dir: &std::path::Path,
+        name: &str,
+        alias_of: Option<&str>,
+    ) -> crate::registry::InstalledPackage {
+        crate::registry::InstalledPackage {
+            name: name.to_string(),
+            alias_of: alias_of.map(str::to_string),
+            version: "1.0.0".to_string(),
+            payload: crate::registry::Payload::Bundle(dir.to_path_buf()),
+            default_config: None,
+            status: crate::registry::InstallStatus::Cached,
+        }
+    }
+
+    fn bundle_file(runtime: &str, dir: &std::path::Path) -> ComposeFile {
+        ComposeFile::parse(
+            &format!(
+                "containers:\n  math:\n    worker: package://math-worker\n    version: 1.0.0\n    runtime: {runtime}\n"
+            ),
+            dir.join("worker-compose.yaml"),
+        )
+        .unwrap()
+    }
+
+    fn bundle_plan(key: &str, start: &StartSpec, dir: &std::path::Path) -> crate::spawn::SpawnPlan {
+        spawn_plan(&SpawnCtx {
+            engine_url: "ws://localhost:49134",
+            namespace: "test-project",
+            compose_namespace: "test-compose",
+            compose_file: &dir.join("worker-compose.yaml"),
+            container_key: key,
+            start,
+            config_path: None,
+            config_name: None,
+            working_dir: dir,
+            user_env: &BTreeMap::new(),
+        })
+    }
+
+    #[test]
+    fn host_bundle_aliases_validate_package_and_keep_independent_instance_state() {
+        let source = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let yaml = "name: math-worker\nscripts:\n  install: 'true'\n  start: node index.js\n";
+        std::fs::write(source.path().join("iii.worker.yaml"), yaml).unwrap();
+        std::fs::write(
+            source.path().join(".iii-compose-integrity.json"),
+            "verified",
+        )
+        .unwrap();
+        let file = bundle_file("host", source.path());
+        let container = &file.containers["math"];
+        let mut workspaces = Vec::new();
+
+        for key in ["math", "math-a", "math-b"] {
+            let (start, _) = installed_start(
+                key,
+                container,
+                bundle_fixture(source.path(), "math-worker", None),
+            )
+            .unwrap();
+            let StartSpec::HostBundle(spec) = &start else {
+                panic!("expected host bundle")
+            };
+            let prepared = crate::host_bundle::prepare(spec, state.path(), key).unwrap();
+            assert_eq!(prepared.workspace, state.path().join(key).join("workspace"));
+            assert!(prepared.install_required);
+            assert_eq!(
+                bundle_plan(key, &start, &prepared.workspace).env["III_WORKER_NAME"],
+                key
+            );
+            std::fs::write(prepared.workspace.join("instance-state"), key).unwrap();
+            crate::host_bundle::mark_prepared(spec, state.path(), key).unwrap();
+            workspaces.push(prepared.workspace);
+        }
+        for (key, workspace) in ["math", "math-a", "math-b"].into_iter().zip(workspaces) {
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("instance-state")).unwrap(),
+                key
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(source.path().join("iii.worker.yaml")).unwrap(),
+            yaml
+        );
+    }
+
+    #[test]
+    fn host_bundle_uses_canonical_registry_metadata_and_rejects_other_packages() {
+        let source = tempfile::tempdir().unwrap();
+        let file = bundle_file("host", source.path());
+        for (manifest_name, accepted) in [
+            ("math-worker", true),
+            ("other-worker", false),
+            ("math", false),
+        ] {
+            std::fs::write(
+                source.path().join("iii.worker.yaml"),
+                format!("name: {manifest_name}\nscripts:\n  start: node index.js\n"),
+            )
+            .unwrap();
+            for (name, alias_of) in [("math-worker", None), ("old-math", Some("math-worker"))] {
+                let result = installed_start(
+                    "math",
+                    &file.containers["math"],
+                    bundle_fixture(source.path(), name, alias_of),
+                );
+                if accepted {
+                    assert!(result.is_ok(), "{result:?}");
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    assert!(
+                        error.contains("resolved package name \"math-worker\""),
+                        "{error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vm_bundle_request_separates_canonical_package_from_instance_names_and_state() {
+        let source = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let file = bundle_file("vm", source.path());
+        for (name, alias_of) in [("math-worker", None), ("old-math", Some("math-worker"))] {
+            for key in ["math", "math-a", "math-b"] {
+                let (start, _) = installed_start(
+                    key,
+                    &file.containers["math"],
+                    bundle_fixture(source.path(), name, alias_of),
+                )
+                .unwrap();
+                let plan = bundle_plan(key, &start, source.path());
+                let (command, request) = vm_prepare_request(
+                    key,
+                    &start,
+                    &plan,
+                    "ws://localhost:49134",
+                    state.path(),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(command, "__bundle-prepare");
+                assert_eq!(request["package_name"], "math-worker");
+                assert_eq!(request["worker_name"], key);
+                assert_eq!(request["extra_env"]["III_WORKER_NAME"], key);
+                assert_eq!(
+                    request["state_dir"],
+                    serde_json::json!(state.path().join(key))
+                );
+                assert_eq!(request["worker_dir"], serde_json::json!(source.path()));
+            }
+        }
+    }
+
+    #[test]
+    fn vm_bundle_refuses_old_or_wrong_package_acknowledgements() {
+        let request = serde_json::json!({"worker_name": "math", "package_name": "math-worker"});
+        for package_name in [
+            None,
+            Some("math"),
+            Some("other-worker"),
+            Some("math-worker"),
+        ] {
+            let plan: VmPlan = serde_json::from_value(serde_json::json!({
+                "program": "/bin/false", "args": [], "package_name": package_name
+            }))
+            .unwrap();
+            assert_eq!(
+                validate_vm_package(&request, &plan).is_ok(),
+                package_name == Some("math-worker")
+            );
+        }
+    }
+
+    #[test]
+    fn local_vm_request_does_not_require_package_identity() {
+        let source = tempfile::tempdir().unwrap();
+        let start = StartSpec::Vm(VmSpec::Local {
+            worker_dir: source.path().to_path_buf(),
+            run_override: Some("node dev.js".to_string()),
+        });
+        let plan = bundle_plan("math", &start, source.path());
+        let (command, request) = vm_prepare_request(
+            "math",
+            &start,
+            &plan,
+            "ws://localhost:49134",
+            source.path(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(command, "__local-prepare");
+        assert!(request.get("package_name").is_none());
+        assert_eq!(request["run_override"], "node dev.js");
+        let old_plan: VmPlan =
+            serde_json::from_value(serde_json::json!({"program": "iii-worker", "args": []}))
+                .unwrap();
+        assert!(validate_vm_package(&request, &old_plan).is_ok());
+    }
 
     const PROJECT: &str = r#"
 namespace: orders

@@ -46,7 +46,11 @@ pub enum StartSpec {
 pub enum VmSpec {
     /// An installed registry bundle. Its manifest command is publisher-owned
     /// and is always read and run inside the guest.
-    Bundle { install_dir: PathBuf },
+    Bundle {
+        install_dir: PathBuf,
+        /// Canonical name from resolved registry metadata, not the instance key.
+        package_name: String,
+    },
     /// A local project whose manifest selected an OCI rootfs. The compose
     /// command may replace the manifest's `scripts.start`, but still runs in
     /// the guest.
@@ -118,7 +122,7 @@ pub fn read_manifest(dir: &Path) -> Result<Option<Manifest>> {
 
 /// Reads the installed bundle fields needed by host execution while preserving
 /// the same mandatory rails as the VM path.
-pub fn read_host_bundle_manifest(dir: &Path, expected_name: &str) -> Result<Manifest> {
+pub fn read_host_bundle_manifest(dir: &Path, expected_package_name: &str) -> Result<Manifest> {
     let path = dir.join(MANIFEST_FILE);
     let metadata = std::fs::symlink_metadata(&path).map_err(|source| ComposeError::Io {
         path: path.clone(),
@@ -154,11 +158,11 @@ pub fn read_host_bundle_manifest(dir: &Path, expected_name: &str) -> Result<Mani
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty());
-    if name != Some(expected_name) {
+    if name != Some(expected_package_name) {
         return Err(ComposeError::InvalidManifest {
             path: path.clone(),
             message: format!(
-                "`name` must match the container key {expected_name:?}, got {}",
+                "`name` must match the resolved package name {expected_package_name:?}, got {}",
                 name.map(|name| format!("{name:?}"))
                     .unwrap_or_else(|| "nothing".to_string())
             ),
